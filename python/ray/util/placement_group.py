@@ -57,13 +57,15 @@ class PlacementGroup:
         It is compatible to ray.get and ray.wait.
 
         Example:
+            .. testcode::
 
-            >>> import ray
-            >>> from ray.util.placement_group import PlacementGroup
-            >>> pg = PlacementGroup([{"CPU": 1}]) # doctest: +SKIP
-            >>> ray.get(pg.ready()) # doctest: +SKIP
-            >>> pg = PlacementGroup([{"CPU": 1}]) # doctest: +SKIP
-            >>> ray.wait([pg.ready()], timeout=0) # doctest: +SKIP
+                import ray
+
+                pg = ray.util.placement_group([{"CPU": 1}])
+                ray.get(pg.ready())
+
+                pg = ray.util.placement_group([{"CPU": 1}])
+                ray.wait([pg.ready()])
 
         """
         self._fill_bundle_cache_if_needed()
@@ -112,6 +114,22 @@ class PlacementGroup:
 
     def __hash__(self):
         return hash(self.id)
+
+    """We want to free up the PG resources when all of its handles go out of scope
+    similar to actor handles."""
+    def __del__(self):
+        try:
+            # Mark that this placement group handle has gone out of scope. Once all pg
+            # handles are out of scope, the pg resources will be freed up automatically.
+            if ray._private.worker:
+                worker = ray._private.worker.global_worker
+                if worker.connected and hasattr(worker, "core_worker"):
+                    worker.core_worker.remove_placement_group_handle_reference(self.id)
+        except AttributeError:
+            # Suppress the attribtue error which is caused by
+            # python destruction ordering issue.
+            # It only happen when python exits.
+            pass
 
 
 @client_mode_wrap
@@ -265,14 +283,14 @@ def get_placement_group(placement_group_name: str) -> PlacementGroup:
         raise ValueError("Please supply a non-empty value to get_placement_group")
     worker = ray._private.worker.global_worker
     worker.check_connected()
-    placement_group_info = ray._private.state.state.get_placement_group_by_name(
+    placement_group_info = worker.core_worker.get_named_placement_group(
         placement_group_name, worker.namespace
     )
     if placement_group_info is None:
         raise ValueError(f"Failed to look up actor with name: {placement_group_name}")
     else:
         return PlacementGroup(
-            PlacementGroupID(hex_to_binary(placement_group_info["placement_group_id"]))
+            placement_group_info
         )
 
 
@@ -300,22 +318,26 @@ def get_current_placement_group() -> Optional[PlacementGroup]:
     (because drivers never belong to any placement group).
 
     Examples:
-        >>> import ray
-        >>> from ray.util.placement_group import PlacementGroup
-        >>> from ray.util.placement_group import get_current_placement_group
-        >>> @ray.remote # doctest: +SKIP
-        ... def f(): # doctest: +SKIP
-        ...     # This will return the placement group the task f belongs to.
-        ...     # It means this pg will be identical to the pg created below.
-        ...     pg = get_current_placement_group() # doctest: +SKIP
-        >>> pg = PlacementGroup([{"CPU": 2}]) # doctest: +SKIP
-        >>> f.options(placement_group=pg).remote() # doctest: +SKIP
+        .. testcode::
 
-        >>> # New script.
-        >>> ray.init() # doctest: +SKIP
-        >>> # New script doesn't belong to any placement group,
-        >>> # so it returns None.
-        >>> assert get_current_placement_group() is None # doctest: +SKIP
+            import ray
+            from ray.util.placement_group import get_current_placement_group
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+            @ray.remote
+            def f():
+                # This returns the placement group the task f belongs to.
+                # It means this pg is identical to the pg created below.
+                return get_current_placement_group()
+
+            pg = ray.util.placement_group([{"CPU": 2}])
+            assert ray.get(f.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg)).remote()) == pg
+
+            # Driver doesn't belong to any placement group,
+            # so it returns None.
+            assert get_current_placement_group() is None
 
     Return:
         PlacementGroup: Placement group object.

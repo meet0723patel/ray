@@ -348,11 +348,51 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
 
   const TaskID &GetCurrentTaskId() const { return worker_context_.GetCurrentTaskID(); }
 
+  int64_t GetCurrentTaskAttemptNumber() const {
+    return worker_context_.GetCurrentTask() != nullptr
+               ? worker_context_.GetCurrentTask()->AttemptNumber()
+               : 0;
+  }
+
   JobID GetCurrentJobId() const { return worker_context_.GetCurrentJobID(); }
 
   const int64_t GetTaskDepth() const { return worker_context_.GetTaskDepth(); }
 
   NodeID GetCurrentNodeId() const { return NodeID::FromBinary(rpc_address_.raylet_id()); }
+
+  /// Create the ObjectRefStream of generator_id.
+  ///
+  /// It is a pass-through method. See TaskManager::CreateObjectRefStream
+  /// for details.
+  ///
+  /// \param[in] generator_id The object ref id of the streaming
+  /// generator task.
+  void CreateObjectRefStream(const ObjectID &generator_id);
+
+  /// Read the next index of a ObjectRefStream of generator_id.
+  /// This API always return immediately.
+  ///
+  /// \param[in] generator_id The object ref id of the streaming
+  /// generator task.
+  /// \param[out] object_ref_out The ObjectReference
+  /// that the caller can convert to its own ObjectRef.
+  /// The current process is always the owner of the
+  /// generated ObjectReference. It will be Nil() if there's
+  /// no next item.
+  /// \return Status ObjectRefEndOfStream if the stream reaches to EoF.
+  /// OK otherwise.
+  Status TryReadObjectRefStream(const ObjectID &generator_id,
+                                rpc::ObjectReference *object_ref_out);
+
+  /// Delete the ObjectRefStream of generator_id
+  /// created by CreateObjectRefStream.
+  ///
+  /// It is a pass-through method. See TaskManager::DelObjectRefStream
+  /// for details.
+  ///
+  /// \param[in] generator_id The object ref id of the streaming
+  /// generator task.
+  void DelObjectRefStream(const ObjectID &generator_id);
 
   const PlacementGroupID &GetCurrentPlacementGroupId() const {
     return worker_context_.GetCurrentPlacementGroupId();
@@ -403,6 +443,8 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
     std::vector<ObjectID> deleted;
     reference_counter_->RemoveLocalReference(object_id, &deleted);
     // TOOD(ilr): better way of keeping an object from being deleted
+    // TODO(sang): This seems bad... We should delete the memory store
+    // properly from reference counter.
     if (!options_.is_local_mode) {
       memory_store_->Delete(deleted);
     }
@@ -698,6 +740,48 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   /// Trigger garbage collection on each worker in the cluster.
   void TriggerGlobalGC();
 
+  /// Report the task caller at caller_address that the intermediate
+  /// task return. It means if this API is used, the caller will be notified
+  /// the task return before the current task is terminated. The caller must
+  /// implement HandleReportGeneratorItemReturns API endpoint
+  /// to handle the intermediate result report.
+  /// This API makes sense only for a generator task
+  /// (task that can return multiple intermediate
+  /// result before the task terminates).
+  ///
+  /// NOTE: The API doesn't guarantee the ordering of the report. The
+  /// caller is supposed to reorder the report based on the item_index.
+  ///
+  /// \param[in] dynamic_return_object A intermediate ray object to report
+  /// to the caller before the task terminates. This object must have been
+  /// created dynamically from this worker via AllocateReturnObject.
+  /// If the Object ID is nil, it means it is the end of the task return.
+  /// In this case, the caller is responsible for setting finished = true,
+  /// otherwise it will panic.
+  /// \param[in] generator_id The return object ref ID from a current generator
+  /// task.
+  /// \param[in] caller_address The address of the caller of the current task
+  /// that created a generator_id.
+  /// \param[in] item_index The index of the task return. It is used to reorder the
+  /// report from the caller side.
+  /// \param[in] finished True indicates there's going to be no more intermediate
+  /// task return. When finished is provided dynamic_return_object's key must be
+  /// pair<nil, empty_pointer>
+  Status ReportGeneratorItemReturns(
+      const std::pair<ObjectID, std::shared_ptr<RayObject>> &dynamic_return_object,
+      const ObjectID &generator_id,
+      const rpc::Address &caller_address,
+      int64_t item_index,
+      bool finished);
+
+  /// Implements gRPC server handler.
+  /// If an executor can generator task return before the task is finished,
+  /// it invokes this endpoint via ReportGeneratorItemReturns RPC.
+  void HandleReportGeneratorItemReturns(
+      rpc::ReportGeneratorItemReturnsRequest request,
+      rpc::ReportGeneratorItemReturnsReply *reply,
+      rpc::SendReplyCallback send_reply_callback) override;
+
   /// Get a string describing object store memory usage for debugging purposes.
   ///
   /// \return std::string The string describing memory usage.
@@ -799,6 +883,12 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   Status WaitPlacementGroupReady(const PlacementGroupID &placement_group_id,
                                  int64_t timeout_seconds);
 
+  /// API to get a placement group by name. If successful, the status will be ok, 
+  /// otherwise, an error will be returned. Internally, this will also increment the 
+  /// the local reference of the placement group handle for automatice lifecycle management
+  /// of reserved resources. 
+  std::pair<PlacementGroupID, Status> GetNamedPlacementGroup(const std::string &name, const std::string &ray_namespace);
+
   /// Submit an actor task.
   ///
   /// \param[in] caller_id ID of the task submitter.
@@ -837,6 +927,56 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   ///
   /// \param[in] actor_id The actor ID to decrease the reference count for.
   void RemoveActorHandleReference(const ActorID &actor_id);
+
+  /// Function to reduce the 
+
+  /// Remove a local reference to the placement group handle. This should be 
+  /// triggered by the frontend language when the handles goes out of scope or
+  /// if the variable was manually deleted by the client.
+  ///
+  /// \param[in] placement_group_id The placment group ID to decrease the reference for.
+  void RemovePlacementHandleReference(const PlacementGroupID &placement_group_id);
+
+  /// Add a local reference to this placement group. This should be called upon the 
+  /// initial creation of a placement group and upon the invocation of get_placement_group
+  /// to generate another local handle in the frontend
+  ///
+  /// \param[in] placement_group_id The placment group ID to increase the reference for.
+  void AddLocalPlacementHandleReference(const PlacementGroupID &placement_group_id,
+                                        const std::string &call_site,
+                                        const rpc::Address &caller_address,
+                                        bool is_detached);
+
+  /// Add reference when a task/actor task is remotely called with this pg as the scheduling strategy
+  ///
+  /// \param[in] placement_group_id The placment group ID to increase the reference for.
+  void AddPlacementOptionReference(const PlacementGroupID &placement_group_id);
+
+  /// Decrease the reference count for a specified placement group handle.
+  /// Should be called by the language frontend when an existing handle goes
+  /// out of scope.
+  ///
+  /// \param[in] placement_group_id The placment group ID to decrease the reference for.
+  void RemovePlacementOptionReference(const PlacementGroupID &placement_group_id);
+
+  /// When an actor is instantiated with a placement group scheduling strategy, we consider that 
+  /// as a borrowed reference which is removed when the respective actor is killed or goes out of scope
+  ///
+  /// \param[in] placement_group_id The placement group ID to increment a borrowed ref for
+  void AddPlacementRequiredReference(const PlacementGroupID &placement_group_id, const ActorID &actor_id);
+
+  /// Decrease the borrow reference of this placement group. This is called when either an actor that
+  /// was instantiated with this PG is manually killed on the frontend or when an actor is automatically
+  /// garbarge collected.
+  /// \param[in] placement_group_id The placement group ID to decrese the borrowed ref for
+  void RemovePlacementRequiredReference(const PlacementGroupID &placement_group_id, const ActorID &actor_id);
+
+  /// Return a callback for when the placement group goes out of scope to handle the automatice freeing of reserved
+  /// resources corresponding to the respective placement group
+  ///
+  /// \param[in] placement_group_id The placement group ID for which to generate the callback for
+  /// \param[out] std::function<void(std::unique_ptr<PlacementGroupID> &)> The callback to be used when the PG goes out of scope
+  void OutOfScopePGCallback(const PlacementGroupID &placement_group_id);
 
   /// Add an actor handle from a serialized string.
   ///
@@ -944,8 +1084,26 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   /// the caller. This is in contrast to static allocation, where the caller
   /// decides at task invocation time how many returns the task should have.
   ///
-  /// \param[out] The ObjectID that the caller should use to store the object.
-  ObjectID AllocateDynamicReturnId();
+  /// NOTE: Normally task_id and put_index it not necessary to be specified
+  /// because we can obtain them from the global worker context. However,
+  /// when the async actor uses this API, it cannot find the correct
+  /// worker context due to the implementation limitation.
+  /// In this case, the caller is responsible for providing the correct
+  /// task ID and index.
+  /// See https://github.com/ray-project/ray/issues/10324 for the further details.
+  ///
+  /// \param[in] owner_address The address of the owner who will own this
+  /// dynamically generated object.
+  /// \param[in] task_id The task id of the dynamically generated return ID.
+  /// If Nil() is specified, it will deduce the Task ID from the current
+  /// worker context.
+  /// \param[in] put_index The equivalent of the return value of
+  /// WorkerContext::GetNextPutIndex.
+  /// If std::nullopt is specified, it will deduce the put index from the
+  /// current worker context.
+  ObjectID AllocateDynamicReturnId(const rpc::Address &owner_address,
+                                   const TaskID &task_id = TaskID::Nil(),
+                                   std::optional<ObjectIDIndexType> put_index = -1);
 
   /// Get a handle to an actor.
   ///
@@ -1125,6 +1283,9 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   /// Return true if the core worker is in the exit process.
   bool IsExiting() const;
 
+  /// Mark this worker is exiting.
+  void SetIsExiting();
+
   /// Retrieve the current statistics about tasks being received and executing.
   /// \return an unordered_map mapping function name to list of (num_received,
   /// num_executing, num_executed). It is a std map instead of absl due to its
@@ -1151,6 +1312,20 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   /// \param stdout_end_offset End offset of the stdout for this task.
   /// \param stderr_end_offset End offset of the stderr for this task.
   void RecordTaskLogEnd(int64_t stdout_end_offset, int64_t stderr_end_offset) const;
+
+  /// (WORKER mode only) Gracefully exit the worker. `Graceful` means the worker will
+  /// exit when it drains all tasks and cleans all owned objects.
+  /// After this method is called, all the tasks in the queue will not be
+  /// executed.
+  ///
+  /// \param exit_type The reason why this worker process is disconnected.
+  /// \param exit_detail The detailed reason for a given exit.
+  /// \param creation_task_exception_pb_bytes It is given when the worker is
+  /// disconnected because the actor is failed due to its exception in its init method.
+  void Exit(const rpc::WorkerExitType exit_type,
+            const std::string &detail,
+            const std::shared_ptr<LocalMemoryBuffer> &creation_task_exception_pb_bytes =
+                nullptr);
 
  private:
   static json OverrideRuntimeEnv(json &child, const std::shared_ptr<json> parent);
@@ -1195,18 +1370,6 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
 
   /// Run the io_service_ event loop. This should be called in a background thread.
   void RunIOService();
-
-  /// (WORKER mode only) Gracefully exit the worker. `Graceful` means the worker will
-  /// exit when it drains all tasks and cleans all owned objects.
-  ///
-  /// \param exit_type The reason why this worker process is disconnected.
-  /// \param exit_detail The detailed reason for a given exit.
-  /// \param creation_task_exception_pb_bytes It is given when the worker is
-  /// disconnected because the actor is failed due to its exception in its init method.
-  void Exit(const rpc::WorkerExitType exit_type,
-            const std::string &detail,
-            const std::shared_ptr<LocalMemoryBuffer> &creation_task_exception_pb_bytes =
-                nullptr);
 
   /// Forcefully exit the worker. `Force` means it will exit actor without draining
   /// or cleaning any resources.
@@ -1551,6 +1714,9 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
   /// Actor title that consists of class name, args, kwargs for actor construction.
   std::string actor_title_ GUARDED_BY(mutex_);
 
+  /// Actor repr name if overrides by the user, empty string if not.
+  std::string actor_repr_name_ GUARDED_BY(mutex_) = "";
+
   /// Number of tasks that have been pushed to the actor but not executed.
   std::atomic<int64_t> task_queue_length_;
 
@@ -1601,9 +1767,9 @@ class CoreWorker : public rpc::CoreWorkerServiceHandler {
                       ObjectID object_id,
                       void *py_future);
 
-  /// we are shutting down and not running further tasks.
-  /// when exiting_ is set to true HandlePushTask becomes no-op.
-  std::atomic<bool> exiting_ = false;
+  /// The detail reason why the core worker has exited.
+  /// If this value is set, it means the exit process has begun.
+  std::optional<std::string> exiting_detail_ GUARDED_BY(mutex_);
 
   std::atomic<bool> is_shutdown_ = false;
 

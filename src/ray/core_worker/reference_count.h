@@ -126,9 +126,35 @@ class ReferenceCounter : public ReferenceCounterInterface,
       const std::vector<ObjectID> &argument_ids_to_remove = std::vector<ObjectID>(),
       std::vector<ObjectID> *deleted = nullptr) LOCKS_EXCLUDED(mutex_);
 
+  /// For placement group reference counting, submitted references are counted
+  /// when a placement group is provided as the scheduling strategy for an actor
+  /// of task. Hence, we increment the submitted task arg count and we will
+  /// decrement it after the task is done executing. 
+  void AddPlacementOptionReference(const ObjectID &placement_id) 
+  LOCKS_EXCLUDED(mutex_);
+
+  /// Decrement the submitted ref count for this placement group once
+  /// a task or actor task has been submitted. ALso, when an actor that 
+  /// was instantiated with this pg goes out of scope and is deleted from
+  /// the object store, we decrement that reference as well to keep track
+  /// of all the actors and task the rely on this pg handle.
+  void DecrementPlacementOptionReference(const ObjectID &placement_id)
+  LOCKS_EXCLUDED(mutex_);
+
+  /// Add an actor for which the specified object is required.
+  void AddPlacementRequiredReference(const ObjectID &placement_id,
+                                     const ObjectID &object_id)
+  LOCKS_EXCLUDED(mutex_);
+
+  /// Remove an actor for which the specified object is required. Used
+  /// when an actor either goes out of scope or is manually killed. 
+  void RemovePlacementRequiredReference(const ObjectID &placement_id,
+                                        const ObjectID &object_id)
+  LOCKS_EXCLUDED(mutex_);
+
   /// Add references for the object dependencies of a resubmitted task. This
   /// does not increment the arguments' lineage ref counts because we should
-  /// have already incremented them when the task was first submitted.
+  /// have already incremented them when the task was first submitted. 
   ///
   /// \param[in] argument_ids The arguments of the task to add references for.
   void UpdateResubmittedTaskReferences(const std::vector<ObjectID> return_ids,
@@ -199,6 +225,28 @@ class ReferenceCounter : public ReferenceCounterInterface,
   /// update its ref count info to show that it contains the dynamically
   /// created ObjectID.
   void AddDynamicReturn(const ObjectID &object_id, const ObjectID &generator_id)
+      LOCKS_EXCLUDED(mutex_);
+
+  /// Own an object that the current owner (current process) dynamically created.
+  ///
+  /// The API is idempotent.
+  ///
+  /// TODO(sang): This API should be merged with AddDynamicReturn when
+  /// we turn on streaming generator by default.
+  ///
+  /// For normal task return, the owner creates and owns the references before
+  /// the object values are created. However, when you dynamically create objects,
+  /// the owner doesn't know (i.e., own) the references until it is reported from
+  /// the executor side.
+  ///
+  /// This API is used to own this type of dynamically generated references.
+  /// The executor should ensure the objects are not GC'ed until the owner
+  /// registers the dynamically created references by this API.
+  ///
+  /// \param[in] object_id The ID of the object that we now own.
+  /// \param[in] generator_id The Object ID of the streaming generator task.
+  void OwnDynamicStreamingTaskReturnRef(const ObjectID &object_id,
+                                        const ObjectID &generator_id)
       LOCKS_EXCLUDED(mutex_);
 
   /// Update the size of the object.
@@ -314,6 +362,8 @@ class ReferenceCounter : public ReferenceCounterInterface,
 
   /// Returns the total number of ObjectIDs currently in scope.
   size_t NumObjectIDsInScope() const LOCKS_EXCLUDED(mutex_);
+
+  size_t NumObjectOwnedByUs() const LOCKS_EXCLUDED(mutex_);
 
   /// Returns a set of all ObjectIDs currently in scope (i.e., nonzero reference count).
   std::unordered_set<ObjectID> GetAllInScopeObjectIDs() const LOCKS_EXCLUDED(mutex_);
@@ -508,12 +558,19 @@ class ReferenceCounter : public ReferenceCounterInterface,
   /// \param[in] min_bytes_to_evict The minimum number of bytes to evict.
   int64_t EvictLineage(int64_t min_bytes_to_evict);
 
+  /// Update that the object is ready to be fetched.
+  void UpdateObjectReady(const ObjectID &object_id);
+
   /// Whether the object is pending creation (the task that creates it is
   /// scheduled/executing).
   bool IsObjectPendingCreation(const ObjectID &object_id) const;
 
   /// Release all local references which registered on this local.
   void ReleaseAllLocalReferences();
+
+  /// Helper to call DeleteReferenceInternal from CoreWorker. This should ONLY by
+  /// used when the object is guaranteed to be not needed.
+  void BatchDelete(const std::vector<ObjectID> &object_ids);
 
  private:
   /// Contains information related to nested object refs only.
@@ -560,6 +617,19 @@ class ReferenceCounter : public ReferenceCounterInterface,
     ///     borrowers. A borrower is removed from the list when it responds
     ///     that it is no longer using the reference.
     absl::flat_hash_set<rpc::WorkerAddress> borrowers;
+  };
+
+  /// Contains information about all the Objects whose lifetimes require this object.
+  /// Currently used to store actors that are instantiated for a specefic
+  /// placement group handle for PG lifecycle management. 
+  struct RequiredInfo {
+    /// A List of Objects that require this object to function. This 
+    /// is currently only used for PG lifecycle management to automatically free
+    /// PG reserved resources. We add an ActorID to this set when an actor is
+    /// instantiated in the frontend with a specific placement group. We keep track
+    /// of the specific actors lifecycle and when it goes out of scope or is manually
+    /// killed in the frontend, we remove its respective ActorID from this set. 
+    absl::flat_hash_set<ObjectID> required;
   };
 
   struct Reference {
@@ -611,6 +681,7 @@ class ReferenceCounter : public ReferenceCounterInterface,
       bool is_nested = nested().contained_in_borrowed_ids.size();
       bool has_borrowers = borrow().borrowers.size() > 0;
       bool was_stored_in_objects = borrow().stored_in_objects.size() > 0;
+      bool has_required = required().required.size() > 0;
 
       bool has_lineage_references = false;
       if (lineage_pinning_enabled && owned_by_us && !is_reconstructable) {
@@ -618,7 +689,7 @@ class ReferenceCounter : public ReferenceCounterInterface,
       }
 
       return !(in_scope || is_nested || has_nested_refs_to_report || has_borrowers ||
-               was_stored_in_objects || has_lineage_references);
+               was_stored_in_objects || has_lineage_references || has_required);
     }
 
     /// Whether the Reference can be deleted. A Reference can only be deleted
@@ -651,6 +722,21 @@ class ReferenceCounter : public ReferenceCounterInterface,
         borrow_info = std::make_unique<BorrowInfo>();
       }
       return borrow_info.get();
+    }
+
+    const RequiredInfo &required() const {
+      if (required_info == nullptr) {
+        static auto *default_info = new RequiredInfo();
+        return *default_info;
+      }
+      return *required_info;
+    }
+
+    RequiredInfo *mutable_required() {
+      if (required_info == nullptr) {
+        required_info = std::make_unique<RequiredInfo>();
+      }
+      return required_info.get();
     }
 
     /// Access NestedReferenceCount without modifications.
@@ -718,6 +804,8 @@ class ReferenceCounter : public ReferenceCounterInterface,
     /// Metadata related to borrowing.
     std::unique_ptr<BorrowInfo> borrow_info;
 
+    /// Metadata related to required Actors/Objects
+    std::unique_ptr<RequiredInfo> required_info;
     /// Callback that will be called when this ObjectID no longer has
     /// references.
     std::function<void(const ObjectID &)> on_delete;
@@ -913,7 +1001,8 @@ class ReferenceCounter : public ReferenceCounterInterface,
   void RemoveObjectLocationInternal(ReferenceTable::iterator it, const NodeID &node_id)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  void UpdateObjectPendingCreation(const ObjectID &object_id, bool pending_creation)
+  void UpdateObjectPendingCreationInternal(const ObjectID &object_id,
+                                           bool pending_creation)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   /// Publish object locations to all subscribers.
@@ -1010,6 +1099,13 @@ class ReferenceCounter : public ReferenceCounterInterface,
   /// due to node failure. These objects are still in scope and need to be
   /// recovered.
   std::vector<ObjectID> objects_to_recover_ GUARDED_BY(mutex_);
+
+  /// Keep track of objects owend by this worker.
+  size_t num_objects_owned_by_us_ GUARDED_BY(mutex_) = 0;
+  /// Used to store object ids that are included in refernce counting for
+  /// lifecycle management purposes but do not have associated IDs in the language
+  /// frontend. This currently includes placment group and actor handles
+  absl::flat_hash_set<ObjectID> phantom_references_ GUARDED_BY(mutex_);
 };
 
 }  // namespace core

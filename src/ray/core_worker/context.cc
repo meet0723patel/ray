@@ -363,6 +363,29 @@ bool WorkerContext::CurrentActorDetached() const {
   return is_detached_actor_;
 }
 
+const ObjectID WorkerContext::GetGeneratorReturnId(
+    const TaskID &task_id, std::optional<ObjectIDIndexType> put_index) {
+  TaskID current_task_id;
+  // We only allow to specify both task id and put index or not specifying both.
+  RAY_CHECK((task_id.IsNil() && !put_index.has_value()) ||
+            (!task_id.IsNil() || put_index.has_value()));
+  if (task_id.IsNil()) {
+    const auto &task_spec = GetCurrentTask();
+    current_task_id = task_spec->TaskId();
+  } else {
+    current_task_id = task_id;
+  }
+
+  ObjectIDIndexType current_put_index;
+  if (!put_index.has_value()) {
+    current_put_index = GetNextPutIndex();
+  } else {
+    current_put_index = put_index.value();
+  }
+
+  return ObjectID::FromIndex(current_task_id, current_put_index);
+}
+
 WorkerThreadContext &WorkerContext::GetThreadContext() const {
   if (thread_context_ == nullptr) {
     absl::ReaderMutexLock lock(&mutex_);
@@ -373,5 +396,17 @@ WorkerThreadContext &WorkerContext::GetThreadContext() const {
 
   return *thread_context_;
 }
+
+void WorkerContext::AddObjectToDestroy(const ObjectID &object_id) {
+  objects_to_destroy_.push_back(object_id);
+}
+
+void WorkerContext::CleanAndClearObjects(const std::function<void(const ObjectID &)> callback) {
+  for (ObjectID i : objects_to_destroy_) {
+    callback(i);
+  }
+  objects_to_destroy_.clear();
+}
+
 }  // namespace core
 }  // namespace ray

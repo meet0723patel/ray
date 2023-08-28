@@ -117,7 +117,8 @@ CoreWorker::CoreWorker(const CoreWorkerOptions &options, const WorkerID &worker_
       num_executed_tasks_(0),
       resource_ids_(new ResourceMappingType()),
       grpc_service_(io_service_, *this),
-      task_execution_service_work_(task_execution_service_) {
+      task_execution_service_work_(task_execution_service_),
+      exiting_detail_(std::nullopt) {
   RAY_LOG(DEBUG) << "Constructing CoreWorker, worker_id: " << worker_id;
 
   // Initialize task receivers.
@@ -224,8 +225,8 @@ CoreWorker::CoreWorker(const CoreWorkerOptions &options, const WorkerID &worker_
 
   // Initialize the task state event buffer.
   auto task_event_gcs_client = std::make_unique<gcs::GcsClient>(options_.gcs_options);
-  task_event_buffer_ =
-      std::make_unique<worker::TaskEventBufferImpl>(std::move(task_event_gcs_client));
+  task_event_buffer_ = std::make_unique<worker::TaskEventBufferImpl>(
+      std::move(task_event_gcs_client), worker_context_.GetCurrentJobID());
   if (RayConfig::instance().task_events_report_interval_ms() > 0) {
     if (!task_event_buffer_->Start().ok()) {
       RAY_CHECK(!task_event_buffer_->Enabled()) << "TaskEventBuffer should be disabled.";
@@ -764,7 +765,11 @@ void CoreWorker::Exit(
                    "tasks have finished"
                 << ", exit_type=" << rpc::WorkerExitType_Name(exit_type)
                 << ", detail=" << detail;
-  exiting_ = true;
+  {
+    absl::MutexLock lock(&mutex_);
+    RAY_CHECK_NE(detail, "");
+    exiting_detail_ = std::optional<std::string>{detail};
+  }
   // Release the resources early in case draining takes a long time.
   RAY_CHECK_OK(
       local_raylet_client_->NotifyDirectCallTaskBlocked(/*release_resources*/ true));
@@ -785,8 +790,12 @@ void CoreWorker::Exit(
          detail = std::move(detail),
          creation_task_exception_pb_bytes]() {
           rpc::DrainServerCallExecutor();
-          Disconnect(exit_type, detail, creation_task_exception_pb_bytes);
           KillChildProcs();
+          // Disconnect should be put close to Shutdown
+          // https://github.com/ray-project/ray/pull/34883
+          // TODO (iycheng) Improve the Process.h and make it able to monitor
+          // process liveness
+          Disconnect(exit_type, detail, creation_task_exception_pb_bytes);
           Shutdown();
         },
         "CoreWorker.Shutdown");
@@ -830,9 +839,13 @@ void CoreWorker::ForceExit(const rpc::WorkerExitType exit_type,
                            const std::string &detail) {
   RAY_LOG(WARNING) << "Force exit the process. "
                    << " Details: " << detail;
-  Disconnect(exit_type, detail);
 
   KillChildProcs();
+  // Disconnect should be put close to Exit
+  // https://github.com/ray-project/ray/pull/34883
+  // TODO (iycheng) Improve the Process.h and make it able to monitor
+  // process liveness
+  Disconnect(exit_type, detail);
 
   // NOTE(hchen): Use `QuickExit()` to force-exit this process without doing cleanup.
   // `exit()` will destruct static objects in an incorrect order, which will lead to
@@ -971,15 +984,14 @@ void CoreWorker::RecordMetrics() {
   memory_store_->RecordMetrics();
 }
 
-std::unordered_map<ObjectID, std::pair<size_t, size_t>>
-CoreWorker::GetAllReferenceCounts() const {
+std::unordered_map<ObjectID, std::pair<size_t, size_t>> CoreWorker::GetAllReferenceCounts() const {
   auto counts = reference_counter_->GetAllReferenceCounts();
-  std::vector<ObjectID> actor_handle_ids = actor_manager_->GetActorHandleIDsFromHandles();
+  // std::vector<ObjectID> actor_handle_ids = actor_manager_->GetActorHandleIDsFromHandles();
   // Strip actor IDs from the ref counts since there is no associated ObjectID
   // in the language frontend.
-  for (const auto &actor_handle_id : actor_handle_ids) {
-    counts.erase(actor_handle_id);
-  }
+  // for (const auto &actor_handle_id : actor_handle_ids) {
+  //   counts.erase(actor_handle_id);
+  // }
   return counts;
 }
 
@@ -1837,6 +1849,16 @@ void CoreWorker::BuildCommonTaskSpec(
     // is a generator of ObjectRefs.
     num_returns = 1;
   }
+  // TODO(sang): Remove this and integrate it to
+  // nun_returns == -1 once migrating to streaming
+  // generator.
+  bool is_streaming_generator = num_returns == kStreamingGeneratorReturn;
+  if (is_streaming_generator) {
+    num_returns = 1;
+    // We are using the dynamic return if
+    // the streaming generator is used.
+    returns_dynamic = true;
+  }
   RAY_CHECK(num_returns >= 0);
   builder.SetCommonTaskSpec(
       task_id,
@@ -1853,6 +1875,7 @@ void CoreWorker::BuildCommonTaskSpec(
       address,
       num_returns,
       returns_dynamic,
+      is_streaming_generator,
       required_resources,
       required_placement_resources,
       debugger_breakpoint,
@@ -1885,6 +1908,12 @@ std::vector<rpc::ObjectReference> CoreWorker::SubmitTask(
                                              next_task_index);
   auto constrained_resources =
       AddPlacementGroupConstraint(task_options.resources, scheduling_strategy);
+
+  const auto placement_group_id = PlacementGroupID::FromBinary(
+    scheduling_strategy.placement_group_scheduling_strategy().placement_group_id()
+  );
+  ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->AddPlacementOptionReference(pg_handle_id);
 
   const std::unordered_map<std::string, double> required_resources;
   auto task_name = task_options.name.empty()
@@ -1923,6 +1952,13 @@ std::vector<rpc::ObjectReference> CoreWorker::SubmitTask(
   } else {
     returned_refs = task_manager_->AddPendingTask(
         task_spec.CallerAddress(), task_spec, CurrentCallSite(), max_retries);
+
+    // If it is a generator task, create a object ref stream.
+    // The language frontend is responsible for calling DeleteObjectRefStream.
+    if (task_spec.IsStreamingGenerator()) {
+      CreateObjectRefStream(task_spec.ReturnId(0));
+    }
+
     io_service_.post(
         [this, task_spec]() {
           RAY_UNUSED(direct_task_submitter_->SubmitTask(task_spec));
@@ -1970,6 +2006,11 @@ Status CoreWorker::CreateActor(const RayFunction &function,
                                   actor_creation_options.scheduling_strategy);
   auto new_resource = AddPlacementGroupConstraint(
       actor_creation_options.resources, actor_creation_options.scheduling_strategy);
+  const auto placement_group_id = PlacementGroupID::FromBinary(
+    actor_creation_options.scheduling_strategy.placement_group_scheduling_strategy().placement_group_id()
+  );
+  ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->AddPlacementRequiredReference(pg_handle_id, ObjectID::ForActorHandle(actor_id));
   const auto actor_name = actor_creation_options.name;
   const auto task_name =
       actor_name.empty()
@@ -2037,6 +2078,11 @@ Status CoreWorker::CreateActor(const RayFunction &function,
       std::move(actor_handle), CurrentCallSite(), rpc_address_, is_detached))
       << "Actor " << actor_id << " already exists";
   *return_actor_id = actor_id;
+  /// An actor handle is created before the actor creation task is submitted to ensure
+  /// that a reference to the handle exists. Here, we add the corresponding placment group id
+  /// to the flat hash set for easy access to ensure that when WaitFroActorOutOfScopeRequest is made
+  /// by GCS, this actor id has its respective placement group stored for when the actor goes out of scope.
+  RAY_CHECK(actor_manager_->AddAssociatedPlacementGroup(actor_id, placement_group_id));
   TaskSpecification task_spec = builder.Build();
   RAY_LOG(DEBUG) << "Submitting actor creation task " << task_spec.DebugString();
   if (options_.is_local_mode) {
@@ -2108,7 +2154,12 @@ Status CoreWorker::CreatePlacementGroup(
       }
     }
   }
-  const PlacementGroupID placement_group_id = PlacementGroupID::Of(GetCurrentJobId());
+
+  const auto next_task_index = worker_context_.GetNextTaskIndex();
+  const PlacementGroupID placement_group_id = PlacementGroupID::Of(GetCurrentJobId(),
+                                                                   worker_context_.GetCurrentTaskID(),
+                                                                   next_task_index);
+  ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
   PlacementGroupSpecBuilder builder;
   builder.SetPlacementGroupSpec(
       placement_group_id,
@@ -2122,6 +2173,21 @@ Status CoreWorker::CreatePlacementGroup(
       worker_context_.CurrentActorDetached());
   PlacementGroupSpecification placement_group_spec = builder.Build();
   *return_placement_group_id = placement_group_id;
+
+  // AddLocalPlacementHandleReference(placement_group_id,
+  //                                 CurrentCallSite(),
+  //                                 rpc_address_,
+  //                                 placement_group_creation_options.is_detached);
+
+  // OutOfScopePGCallback(placement_group_id);
+
+  const auto current_task = worker_context_.GetCurrentTaskID();
+  if (!current_task.IsNil()) {
+    auto spec = task_manager_->GetTaskSpec(current_task);
+    spec->AddObjectToDestroy(pg_handle_id);
+    spec->SetHasDestroyable(true);
+  }
+
   RAY_LOG(INFO) << "Submitting Placement Group creation to GCS: " << placement_group_id;
   const auto status =
       gcs_client_->PlacementGroups().SyncCreatePlacementGroup(placement_group_spec);
@@ -2132,9 +2198,17 @@ Status CoreWorker::CreatePlacementGroup(
            << ". It is probably "
               "because GCS server is dead or there's a high load there.";
     return Status::TimedOut(stream.str());
-  } else {
-    return status;
+  } else if (status.ok()){
+    AddLocalPlacementHandleReference(placement_group_id,
+                                  CurrentCallSite(),
+                                  rpc_address_,
+                                  placement_group_creation_options.is_detached);
+
+    OutOfScopePGCallback(placement_group_id);
   }
+
+  return status;
+
 }
 
 Status CoreWorker::RemovePlacementGroup(const PlacementGroupID &placement_group_id) {
@@ -2165,6 +2239,67 @@ Status CoreWorker::WaitPlacementGroupReady(const PlacementGroupID &placement_gro
   } else {
     return status;
   }
+}
+
+std::pair<PlacementGroupID, Status> CoreWorker::GetNamedPlacementGroup(const std::string &name,
+                                          const std::string &ray_namespace) {
+
+  RAY_CHECK(!name.empty());
+
+  // std::unique_ptr<rpc::PlacementGroupTableData> placement_group_table_data_;
+  // PlacementGroupID placement_group_id;
+
+  // const auto callback = [placement_group_table_data_](const Status &status,
+  //                                                     const rpc::PlacementGroupTableData &result) {
+  //   RAY_CHECK_OK(status);
+  //   if (result) {
+  //     *placement_group_table_data_ = result;
+  //   }
+  // };
+
+  // const auto status = gcs_client_->PlacementGroups().AsyncGetByName(
+  //     name,
+  //     ray_namespace,
+  //     callback);
+
+  // if (placement_group_table_data_) {
+  //   placement_group_id = PlacementGroupID::FromBinary(placement_group_table_data_.placement_group_id());
+  // }
+
+  // if (status.ok()) {
+  //   // const auto data_string = std::string(placement_group_table_data_.get().data(), 
+  //   //                                     placement_group_table_data_.get().size());
+  //   // placement_group_id = PlacementGroupID::FromHex(data_string);
+  //   ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
+  //   reference_counter_->AddLocalReference(pg_handle_id, CurrentCallSite());
+  // } else {
+  //   RAY_LOG(DEBUG) << "Failed to look up placement group with name: " << name;
+  //   placement_group_id = PlacementGroupID::Nil();
+  // }
+
+  // if (status.IsTimedOut()) {
+  //   std::ostringstream stream;
+  //   stream << "There was timeout in getting the placement group, "
+  //             "probably because the GCS server is dead or under high load .";
+  //   std::string error_str = stream.str();
+  //   RAY_LOG(ERROR) << error_str;
+  //   return std::make_pair(PlacementGroupID::Nil(), Status::TimedOut(error_str));
+  // }
+
+  // if (placement_group_id.IsNil()) {
+  //   std::ostringstream stream;
+  //   stream << "Failed to look up placement group with name '" << name << "'. This could "
+  //          << "because 1. You are trying to look up a named placement group you "
+  //          << "didn't create. 2. The named placement group was automatically freed. "
+  //          << "3. You did not use a namespace matching the namespace of the "
+  //          << "placement group.";
+  //   auto error_msg = stream.str();
+  //   RAY_LOG(WARNING) << error_msg;
+  //   return std::make_pair(PlacementGroupID::Nil(), Status::NotFound(error_msg));
+  // }
+
+  return std::make_pair(PlacementGroupID::Nil(), Status::OK());
+
 }
 
 Status CoreWorker::SubmitActorTask(const ActorID &actor_id,
@@ -2248,6 +2383,13 @@ Status CoreWorker::SubmitActorTask(const ActorID &actor_id,
   } else {
     returned_refs = task_manager_->AddPendingTask(
         rpc_address_, task_spec, CurrentCallSite(), actor_handle->MaxTaskRetries());
+
+    // If it is a generator task, create a object ref stream.
+    // The language frontend is responsible for calling DeleteObjectRefStream.
+    if (task_spec.IsStreamingGenerator()) {
+      CreateObjectRefStream(task_spec.ReturnId(0));
+    }
+
     RAY_CHECK_OK(direct_actor_submitter_->SubmitTask(task_spec));
   }
   task_returns = std::move(returned_refs);
@@ -2374,6 +2516,63 @@ Status CoreWorker::KillActorLocalMode(const ActorID &actor_id) {
 void CoreWorker::RemoveActorHandleReference(const ActorID &actor_id) {
   ObjectID actor_handle_id = ObjectID::ForActorHandle(actor_id);
   reference_counter_->RemoveLocalReference(actor_handle_id, nullptr);
+}
+
+void CoreWorker::RemovePlacementHandleReference(const PlacementGroupID &placement_id) {
+  ObjectID pg_handle_id = placement_id.GeneratePlacementHandle();
+  reference_counter_->RemoveLocalReference(pg_handle_id, nullptr);
+}
+
+void CoreWorker::AddLocalPlacementHandleReference(const PlacementGroupID &placement_group_id,
+                                                  const std::string &call_site,
+                                                  const rpc::Address &caller_address,
+                                                  bool is_detached) {
+ 
+  ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
+  if (!is_detached) {
+    reference_counter_->AddOwnedObject(pg_handle_id,
+                                       {},
+                                       caller_address,
+                                       call_site,
+                                       -1,
+                                       true,
+                                       false);
+  }
+
+  reference_counter_->AddLocalReference(pg_handle_id, call_site);
+
+}
+
+void CoreWorker::AddPlacementOptionReference(const PlacementGroupID &placement_group_id) {
+  ObjectID pg_object_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->AddPlacementOptionReference(pg_object_id);
+}
+
+void CoreWorker::RemovePlacementOptionReference(const PlacementGroupID &placement_group_id) {
+  ObjectID pg_object_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->DecrementPlacementOptionReference(pg_object_id);
+}
+
+void CoreWorker::AddPlacementRequiredReference(const PlacementGroupID &placement_group_id,
+                                               const ActorID &actor_id) {
+  ObjectID pg_object_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->AddPlacementRequiredReference(pg_object_id, ObjectID::ForActorHandle(actor_id));
+}
+
+void CoreWorker::RemovePlacementRequiredReference(const PlacementGroupID &placement_group_id,
+                                                  const ActorID &actor_id) {
+  ObjectID pg_object_id = placement_group_id.GeneratePlacementHandle();
+  reference_counter_->RemovePlacementRequiredReference(pg_object_id, ObjectID::ForActorHandle(actor_id));
+}
+
+void CoreWorker::OutOfScopePGCallback(const PlacementGroupID &placement_group_id) {
+  ObjectID pg_handle_id = placement_group_id.GeneratePlacementHandle();
+  auto callback = [this, placement_group_id](
+    const ObjectID &object_id
+  ) {
+    RemovePlacementGroup(placement_group_id);
+  };
+  reference_counter_->SetDeleteCallback(pg_handle_id, callback);
 }
 
 ActorID CoreWorker::DeserializeAndRegisterActorHandle(const std::string &serialized,
@@ -2535,16 +2734,39 @@ Status CoreWorker::ExecuteTask(
     bool *is_retryable_error,
     std::string *application_error) {
   RAY_LOG(DEBUG) << "Executing task, task info = " << task_spec.DebugString();
+
+  // If the worker is exitted via Exit API, we shouldn't execute
+  // tasks anymore.
+  if (IsExiting()) {
+    absl::MutexLock lock(&mutex_);
+    return Status::IntentionalSystemExit(
+        absl::StrCat("Worker has already exited. Detail: ", exiting_detail_.value()));
+  }
+
   task_queue_length_ -= 1;
   num_executed_tasks_ += 1;
 
   // Modify the worker's per function counters.
   std::string func_name = task_spec.FunctionDescriptor()->CallString();
+  std::string actor_repr_name = "";
+  {
+    absl::MutexLock lock(&mutex_);
+    actor_repr_name = actor_repr_name_;
+  }
   if (!options_.is_local_mode) {
     task_counter_.MovePendingToRunning(func_name, task_spec.IsRetry());
 
-    task_manager_->RecordTaskStatusEvent(
-        task_spec.AttemptNumber(), task_spec, rpc::TaskStatus::RUNNING);
+    if (task_spec.IsActorTask() && !actor_repr_name.empty()) {
+      task_manager_->RecordTaskStatusEvent(
+          task_spec.AttemptNumber(),
+          task_spec,
+          rpc::TaskStatus::RUNNING,
+          /* include_task_info */ false,
+          worker::TaskStatusEvent::TaskStateUpdate(actor_repr_name));
+    } else {
+      task_manager_->RecordTaskStatusEvent(
+          task_spec.AttemptNumber(), task_spec, rpc::TaskStatus::RUNNING);
+    }
 
     worker_context_.SetCurrentTask(task_spec);
     SetCurrentTaskId(task_spec.TaskId(), task_spec.AttemptNumber(), task_spec.GetName());
@@ -2577,6 +2799,9 @@ Status CoreWorker::ExecuteTask(
     dynamic_return_objects = NULL;
   } else if (task_spec.AttemptNumber() > 0) {
     for (const auto &dynamic_return_id : task_spec.DynamicReturnIds()) {
+      // Increase the put index so that when the generator creates a new obj
+      // the object id won't conflict.
+      worker_context_.GetNextPutIndex();
       dynamic_return_objects->push_back(
           std::make_pair<>(dynamic_return_id, std::shared_ptr<RayObject>()));
       RAY_LOG(DEBUG) << "Re-executed task " << task_spec.TaskId()
@@ -2637,7 +2862,8 @@ Status CoreWorker::ExecuteTask(
       application_error,
       defined_concurrency_groups,
       name_of_concurrency_group_to_execute,
-      /*is_reattempt=*/task_spec.AttemptNumber() > 0);
+      /*is_reattempt=*/task_spec.AttemptNumber() > 0,
+      /*is_streaming_generator*/ task_spec.IsStreamingGenerator());
 
   // Get the reference counts for any IDs that we borrowed during this task,
   // remove the local reference for these IDs, and return the ref count info to
@@ -2730,6 +2956,28 @@ Status CoreWorker::SealReturnObject(const ObjectID &return_id,
   return status;
 }
 
+void CoreWorker::CreateObjectRefStream(const ObjectID &generator_id) {
+  task_manager_->CreateObjectRefStream(generator_id);
+}
+
+void CoreWorker::DelObjectRefStream(const ObjectID &generator_id) {
+  task_manager_->DelObjectRefStream(generator_id);
+}
+
+Status CoreWorker::TryReadObjectRefStream(const ObjectID &generator_id,
+                                          rpc::ObjectReference *object_ref_out) {
+  ObjectID object_id;
+  const auto &status = task_manager_->TryReadObjectRefStream(generator_id, &object_id);
+  if (!status.ok()) {
+    return status;
+  }
+
+  RAY_CHECK(object_ref_out != nullptr);
+  object_ref_out->set_object_id(object_id.Binary());
+  object_ref_out->mutable_owner_address()->CopyFrom(rpc_address_);
+  return status;
+}
+
 bool CoreWorker::PinExistingReturnObject(const ObjectID &return_id,
                                          std::shared_ptr<RayObject> *return_object,
                                          const ObjectID &generator_id) {
@@ -2783,14 +3031,66 @@ bool CoreWorker::PinExistingReturnObject(const ObjectID &return_id,
   }
 }
 
-ObjectID CoreWorker::AllocateDynamicReturnId() {
-  const auto &task_spec = worker_context_.GetCurrentTask();
-  const auto return_id =
-      ObjectID::FromIndex(task_spec->TaskId(), worker_context_.GetNextPutIndex());
+ObjectID CoreWorker::AllocateDynamicReturnId(const rpc::Address &owner_address,
+                                             const TaskID &task_id,
+                                             std::optional<ObjectIDIndexType> put_index) {
+  const auto return_id = worker_context_.GetGeneratorReturnId(task_id, put_index);
   AddLocalReference(return_id, "<temporary (ObjectRefGenerator)>");
-  reference_counter_->AddBorrowedObject(
-      return_id, ObjectID::Nil(), worker_context_.GetCurrentTask()->CallerAddress());
+  reference_counter_->AddBorrowedObject(return_id, ObjectID::Nil(), owner_address);
   return return_id;
+}
+
+Status CoreWorker::ReportGeneratorItemReturns(
+    const std::pair<ObjectID, std::shared_ptr<RayObject>> &dynamic_return_object,
+    const ObjectID &generator_id,
+    const rpc::Address &caller_address,
+    int64_t item_index,
+    bool finished) {
+  RAY_LOG(DEBUG) << "Write the object ref stream, index: " << item_index
+                 << " finished: " << finished << ", id: " << dynamic_return_object.first;
+  rpc::ReportGeneratorItemReturnsRequest request;
+  request.mutable_worker_addr()->CopyFrom(rpc_address_);
+  request.set_item_index(item_index);
+  request.set_finished(finished);
+  request.set_generator_id(generator_id.Binary());
+  auto client = core_worker_client_pool_->GetOrConnect(caller_address);
+
+  if (!dynamic_return_object.first.IsNil()) {
+    RAY_CHECK_EQ(finished, false);
+    auto return_object_proto = request.add_dynamic_return_objects();
+    SerializeReturnObject(
+        dynamic_return_object.first, dynamic_return_object.second, return_object_proto);
+    std::vector<ObjectID> deleted;
+    // When we allocate a dynamic return ID (AllocateDynamicReturnId),
+    // we borrow the object. When the object value is allocatd, the
+    // memory store is updated. We should clear borrowers and memory store
+    // here.
+    ReferenceCounter::ReferenceTableProto borrowed_refs;
+    reference_counter_->PopAndClearLocalBorrowers(
+        {dynamic_return_object.first}, &borrowed_refs, &deleted);
+    memory_store_->Delete(deleted);
+  } else {
+    // fininshed must be set when dynamic_return_object is nil.
+    RAY_CHECK_EQ(finished, true);
+  }
+
+  client->ReportGeneratorItemReturns(
+      request,
+      [](const Status &status, const rpc::ReportGeneratorItemReturnsReply &reply) {
+        if (!status.ok()) {
+          // TODO(sang): Handle network error more gracefully.
+          RAY_LOG(ERROR) << "Failed to send the object ref.";
+        }
+      });
+  return Status::OK();
+}
+
+void CoreWorker::HandleReportGeneratorItemReturns(
+    rpc::ReportGeneratorItemReturnsRequest request,
+    rpc::ReportGeneratorItemReturnsReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  task_manager_->HandleReportGeneratorItemReturns(request);
+  send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
 std::vector<rpc::ObjectReference> CoreWorker::ExecuteTaskLocalMode(
@@ -2929,6 +3229,8 @@ Status CoreWorker::GetAndPinArgsForExecutor(const TaskSpecification &task,
 void CoreWorker::HandlePushTask(rpc::PushTaskRequest request,
                                 rpc::PushTaskReply *reply,
                                 rpc::SendReplyCallback send_reply_callback) {
+  RAY_LOG(DEBUG) << "Received Handle Push Task "
+                 << TaskID::FromBinary(request.task_spec().task_id());
   if (HandleWrongRecipient(WorkerID::FromBinary(request.intended_worker_id()),
                            send_reply_callback)) {
     return;
@@ -2950,10 +3252,18 @@ void CoreWorker::HandlePushTask(rpc::PushTaskRequest request,
   // execution service.
   if (request.task_spec().type() == TaskType::ACTOR_TASK) {
     task_execution_service_.post(
-        [this, request, reply, send_reply_callback = std::move(send_reply_callback)] {
+        [this,
+         request,
+         reply,
+         send_reply_callback = std::move(send_reply_callback),
+         func_name] {
           // We have posted an exit task onto the main event loop,
           // so shouldn't bother executing any further work.
-          if (exiting_) return;
+          if (IsExiting()) {
+            RAY_LOG(INFO) << "Queued task " << func_name
+                          << " won't be executed because the worker already exited.";
+            return;
+          }
           direct_task_receiver_->HandleTask(request, reply, send_reply_callback);
         },
         "CoreWorker.HandlePushTaskActor");
@@ -2962,10 +3272,14 @@ void CoreWorker::HandlePushTask(rpc::PushTaskRequest request,
     // the task execution service.
     direct_task_receiver_->HandleTask(request, reply, send_reply_callback);
     task_execution_service_.post(
-        [=] {
+        [this, func_name] {
           // We have posted an exit task onto the main event loop,
           // so shouldn't bother executing any further work.
-          if (exiting_) return;
+          if (IsExiting()) {
+            RAY_LOG(INFO) << "Queued task " << func_name
+                          << " won't be executed because the worker already exited.";
+            return;
+          }
           direct_task_receiver_->RunNormalTasksFromQueue();
         },
         "CoreWorker.HandlePushTask");
@@ -3146,7 +3460,13 @@ void CoreWorker::ProcessSubscribeForObjectEviction(
     // counter so that we know that it exists.
     const auto generator_id = ObjectID::FromBinary(message.generator_id());
     RAY_CHECK(!generator_id.IsNil());
-    reference_counter_->AddDynamicReturn(object_id, generator_id);
+    if (task_manager_->ObjectRefStreamExists(generator_id)) {
+      // ObjectRefStreamExists is used to distinguigsh num_returns="dynamic" vs
+      // "streaming".
+      task_manager_->TemporarilyOwnGeneratorReturnRefIfNeeded(object_id, generator_id);
+    } else {
+      reference_counter_->AddDynamicReturn(object_id, generator_id);
+    }
   }
 
   // Returns true if the object was present and the callback was added. It might have
@@ -3279,8 +3599,13 @@ void CoreWorker::AddSpilledObjectLocationOwner(
     // object is spilled before the reply from the task that created the
     // object. Add the dynamically created object to our ref counter so that we
     // know that it exists.
-    RAY_CHECK(!generator_id->IsNil());
-    reference_counter_->AddDynamicReturn(object_id, *generator_id);
+    if (task_manager_->ObjectRefStreamExists(*generator_id)) {
+      // ObjectRefStreamExists is used to distinguigsh num_returns="dynamic" vs
+      // "streaming".
+      task_manager_->TemporarilyOwnGeneratorReturnRefIfNeeded(object_id, *generator_id);
+    } else {
+      reference_counter_->AddDynamicReturn(object_id, *generator_id);
+    }
   }
 
   auto reference_exists =
@@ -3308,9 +3633,16 @@ void CoreWorker::AddObjectLocationOwner(const ObjectID &object_id,
   // until the task finishes.
   const auto &maybe_generator_id = task_manager_->TaskGeneratorId(object_id.TaskId());
   if (!maybe_generator_id.IsNil()) {
-    // The task is a generator and may not have finished yet. Add the internal
-    // ObjectID so that we can update its location.
-    reference_counter_->AddDynamicReturn(object_id, maybe_generator_id);
+    if (task_manager_->ObjectRefStreamExists(maybe_generator_id)) {
+      // ObjectRefStreamExists is used to distinguigsh num_returns="dynamic" vs
+      // "streaming".
+      task_manager_->TemporarilyOwnGeneratorReturnRefIfNeeded(object_id,
+                                                              maybe_generator_id);
+    } else {
+      // The task is a generator and may not have finished yet. Add the internal
+      // ObjectID so that we can update its location.
+      reference_counter_->AddDynamicReturn(object_id, maybe_generator_id);
+    }
     RAY_UNUSED(reference_counter_->AddObjectLocation(object_id, node_id));
   }
 }
@@ -3487,6 +3819,7 @@ void CoreWorker::HandleGetCoreWorkerStats(rpc::GetCoreWorkerStatsRequest request
   stats->set_task_queue_length(task_queue_length_);
   stats->set_num_executed_tasks(num_executed_tasks_);
   stats->set_num_object_refs_in_scope(reference_counter_->NumObjectIDsInScope());
+  stats->set_num_owned_objects(reference_counter_->NumObjectOwnedByUs());
   stats->set_ip_address(rpc_address_.ip_address());
   stats->set_port(rpc_address_.port());
   stats->set_pid(getpid());
@@ -3808,13 +4141,19 @@ void CoreWorker::SetActorTitle(const std::string &title) {
 void CoreWorker::SetActorReprName(const std::string &repr_name) {
   RAY_CHECK(direct_task_receiver_ != nullptr);
   direct_task_receiver_->SetActorReprName(repr_name);
+
+  absl::MutexLock lock(&mutex_);
+  actor_repr_name_ = repr_name;
 }
 
 rpc::JobConfig CoreWorker::GetJobConfig() const {
   return worker_context_.GetCurrentJobConfig();
 }
 
-bool CoreWorker::IsExiting() const { return exiting_; }
+bool CoreWorker::IsExiting() const {
+  absl::MutexLock lock(&mutex_);
+  return exiting_detail_.has_value();
+}
 
 std::unordered_map<std::string, std::vector<int64_t>> CoreWorker::GetActorCallStats()
     const {

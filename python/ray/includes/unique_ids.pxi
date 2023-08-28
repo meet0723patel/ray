@@ -21,8 +21,9 @@ from ray.includes.unique_ids cimport (
     CTaskID,
     CUniqueID,
     CWorkerID,
-    CPlacementGroupID
+    CPlacementGroupID,
 )
+
 
 import ray
 from ray._private.utils import decode
@@ -360,9 +361,11 @@ cdef class PlacementGroupID(BaseID):
         return cls(os.urandom(CPlacementGroupID.Size()))
 
     @classmethod
-    def of(cls, job_id):
+    def of(cls, job_id,  parent_task_id, parent_task_counter):
         assert isinstance(job_id, JobID)
-        return cls(CPlacementGroupID.Of(CJobID.FromBinary(job_id.binary())).Binary())
+        return cls(CPlacementGroupID.Of(CJobID.FromBinary(job_id.binary()),
+                               CTaskID.FromBinary(parent_task_id.binary()),
+                               parent_task_counter).Binary())
 
     @classmethod
     def nil(cls):

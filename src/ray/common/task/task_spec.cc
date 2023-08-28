@@ -19,6 +19,7 @@
 
 #include "ray/common/ray_config.h"
 #include "ray/common/runtime_env_common.h"
+#include "ray/stats/metric_defs.h"
 #include "ray/util/logging.h"
 
 namespace ray {
@@ -47,11 +48,9 @@ SchedulingClass TaskSpecification::GetSchedulingClass(
     sched_cls_id = ++next_sched_id_;
     // TODO(ekl) we might want to try cleaning up task types in these cases
     if (sched_cls_id > 100) {
-      RAY_LOG(WARNING) << "More than " << sched_cls_id
-                       << " types of tasks seen, this may reduce performance.";
-    } else if (sched_cls_id > 1000) {
-      RAY_LOG(ERROR) << "More than " << sched_cls_id
-                     << " types of tasks seen, this may reduce performance.";
+      RAY_LOG_EVERY_MS(WARNING, 1000)
+          << "More than " << sched_cls_id
+          << " types of tasks seen, this may reduce performance.";
     }
     sched_cls_to_id_[sched_cls] = sched_cls_id;
     sched_id_to_cls_.emplace(sched_cls_id, sched_cls);
@@ -217,6 +216,12 @@ ObjectID TaskSpecification::ReturnId(size_t return_index) const {
 }
 
 bool TaskSpecification::ReturnsDynamic() const { return message_->returns_dynamic(); }
+
+// TODO(sang): Merge this with ReturnsDynamic once migrating to the
+// streaming generator.
+bool TaskSpecification::IsStreamingGenerator() const {
+  return message_->streaming_generator();
+}
 
 std::vector<ObjectID> TaskSpecification::DynamicReturnIds() const {
   RAY_CHECK(message_->returns_dynamic());
@@ -523,6 +528,20 @@ bool TaskSpecification::IsRetriable() const {
   return true;
 }
 
+void TaskSpecification::EmitTaskMetrics() const {
+  double duration_s = (GetMessage().lease_grant_timestamp_ms() -
+                       GetMessage().dependency_resolution_timestamp_ms()) /
+                      1000;
+
+  if (IsActorCreationTask()) {
+    stats::STATS_scheduler_placement_time_s.Record(duration_s,
+                                                   {{"WorkloadType", "Actor"}});
+  } else {
+    stats::STATS_scheduler_placement_time_s.Record(duration_s,
+                                                   {{"WorkloadType", "Task"}});
+  }
+}
+
 std::string TaskSpecification::CallSiteString() const {
   std::ostringstream stream;
   auto desc = FunctionDescriptor();
@@ -535,6 +554,32 @@ std::string TaskSpecification::CallSiteString() const {
   }
   stream << FunctionDescriptor()->CallSiteString();
   return stream.str();
+}
+
+std::vector<ObjectID> TaskSpecification::ObjectsToDestroy() const {
+  // RAY_CHECK(message_->has_destroyable());
+  // std::vector<ObjectID> objects_to_destroy;
+  // for (const auto &obj_to_destroy : message_->objects_to_destroy()) {
+  //   objects_to_destroy.push_back(ObjectID::FromBinary(obj_to_destroy));
+  // }
+  return objects_to_destroy_;
+}
+
+void TaskSpecification::AddObjectToDestroy(const ObjectID &object_id) {
+  objects_to_destroy_.push_back(object_id);
+}
+
+void TaskSpecification::CleanUpObjects(const std::function<void(const std::vector<ObjectID> &)> callback) const {
+  RAY_CHECK(has_destroyable_);
+  callback(objects_to_destroy_);
+}
+
+bool TaskSpecification::HasDestroyable() const {
+  return has_destroyable_;
+}
+
+void TaskSpecification::SetHasDestroyable(const bool &value) {
+  has_destroyable_ = value;
 }
 
 WorkerCacheKey::WorkerCacheKey(

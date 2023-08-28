@@ -84,6 +84,8 @@ class GcsPlacementGroup {
     placement_group_table_data_.set_max_cpu_fraction_per_node(
         placement_group_spec.max_cpu_fraction_per_node());
     placement_group_table_data_.set_ray_namespace(ray_namespace);
+    placement_group_table_data_.set_placement_group_creation_timestamp_ms(
+        current_sys_time_ms());
     SetupStates();
   }
 
@@ -139,6 +141,9 @@ class GcsPlacementGroup {
   /// Get the actor id that created the placement group.
   const ActorID GetCreatorActorId() const;
 
+  /// Get the remote task that created this placement group.
+  const TaskID GetCreatorTaskId() const;
+
   /// Get the job id that created the placement group.
   const JobID GetCreatorJobId() const;
 
@@ -147,6 +152,9 @@ class GcsPlacementGroup {
 
   /// Mark that the creator actor of this placement group is dead.
   void MarkCreatorActorDead();
+
+  /// Mark that the creator task of this placement group is dead.
+  void MarkCreatorTaskDead();
 
   /// Return True if the placement group lifetime is done. False otherwise.
   bool IsPlacementGroupLifetimeDone() const;
