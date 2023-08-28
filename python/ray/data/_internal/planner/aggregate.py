@@ -8,17 +8,20 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.planner.exchange.aggregate_task_spec import (
     SortAggregateTaskSpec,
 )
-from ray.data._internal.planner.exchange.push_based_shuffle_task_scheduler import (
-    PushBasedShuffleTaskScheduler,
-)
 from ray.data._internal.planner.exchange.pull_based_shuffle_task_scheduler import (
     PullBasedShuffleTaskScheduler,
 )
+from ray.data._internal.planner.exchange.push_based_shuffle_task_scheduler import (
+    PushBasedShuffleTaskScheduler,
+)
 from ray.data._internal.planner.exchange.sort_task_spec import SortTaskSpec
 from ray.data._internal.stats import StatsDict
+from ray.data._internal.util import unify_block_metadata_schema
 from ray.data.aggregate import AggregateFn
 from ray.data.context import DataContext
 from ray.data._internal.util import unify_block_metadata_schema
+from ray.data._internal.util import row_zip
+
 
 
 def generate_aggregate_fn(
@@ -35,6 +38,7 @@ def generate_aggregate_fn(
         refs: List[RefBundle],
         ctx: TaskContext,
     ) -> Tuple[List[RefBundle], StatsDict]:
+        nonlocal key
         blocks = []
         metadata = []
         for ref_bundle in refs:
@@ -49,7 +53,7 @@ def generate_aggregate_fn(
 
         num_mappers = len(blocks)
 
-        if key is None:
+        if len(key) == 0:
             num_outputs = 1
             boundaries = []
         else:
@@ -58,9 +62,13 @@ def generate_aggregate_fn(
             # Sample boundaries for aggregate key.
             boundaries = SortTaskSpec.sample_boundaries(
                 blocks,
-                [(key, "ascending")] if isinstance(key, str) else key,
+                key,
                 num_outputs,
             )
+            if len(boundaries) == 1:
+                boundaries = boundaries[0]
+            else:
+                boundaries = row_zip(boundaries)
 
         agg_spec = SortAggregateTaskSpec(
             boundaries=boundaries,
@@ -72,6 +80,6 @@ def generate_aggregate_fn(
         else:
             scheduler = PullBasedShuffleTaskScheduler(agg_spec)
 
-        return scheduler.execute(refs, num_outputs)
+        return scheduler.execute(refs, num_outputs, ctx)
 
     return fn

@@ -1,4 +1,8 @@
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Union, Any
+from ray.data._internal.remote_fn import cached_remote_fn
+from ray.data._internal.progress_bar import ProgressBar
+import numpy as np
+from ray.data._internal.sort_key import SortKey
 
 try:
     import pyarrow
@@ -12,9 +16,90 @@ if TYPE_CHECKING:
 def sort(table: "pyarrow.Table", key: "SortKeyT", descending: bool) -> "pyarrow.Table":
     import pyarrow.compute as pac
 
-    indices = pac.sort_indices(table, sort_keys=key)
+    # keys = []
+    # for k in key:
+    #     if k[1] == "ascending":
+    #         keys.append((k[0], "descending" if descending else "ascending"))
+    #     else:
+    #         keys.append(k[0], "ascending" if descending else "descending")
+
+    if len(key) == 0:
+        keys = []
+        for name in table.column_names:
+            keys.append((name, "ascending"))
+        indices = pac.sort_indices(table, sort_keys=keys)
+        return take_table(table, indices)
+
+    indices = pac.sort_indices(table, sort_keys=key.to_arrow_sort_args())
     return take_table(table, indices)
 
+
+def sort_indices(table: "pyarrow.Table", key: "SortKeyT", descending: bool) -> "pyarrow.Table":
+    import pyarrow.compute as pac
+
+    indices = pac.sort_indices(table, sort_keys=key.to_arrow_sort_args())
+    return indices
+
+
+def searchsorted(table: "pyarrow.Table", boundaries: List[Union[int, List[int]]], key: "SortKeyT", descending: bool) -> List[int]:
+    """
+    This method finds the index to place a row containing a set of columnar values to 
+    maintain ordering of the sorted table. 
+    """
+
+    # partitionIdx = cached_remote_fn(find_partitionIdx)
+    # bound_results = [partitionIdx.remote(table, [i] if not isinstance(i, np.ndarray) else i, key, descending) for i in boundaries]
+    # bounds_bar = ProgressBar("Sort and Partition", len(bound_results))
+    # bounds = bounds_bar.fetch_until_complete(bound_results)
+    bounds = [find_partitionIdx(table, [i] if not isinstance(i, np.ndarray) else i, key, descending) for i in boundaries]
+
+    return bounds
+
+
+def find_partitionIdx(table: "pyarrow.Table", desired: List[Any], key:"SortKeyT", descending: bool) -> int:
+
+    """
+    This function is an implementation of np.searchsorted for pyarrow tables. It also
+    extends the existing functionality of the numpy version as well as similar 
+    implementation by allowing the user to pass in multi columnar keys with their ordering
+    info to find the left or right most index at which the row could be placed into the table
+    to maintain the current ordering. Note that the function assumes that the table 
+    passed to it is already sorted with the desired columns and respective orders and the 
+    order key passed to the function should be the one used to compute the table ordering.
+    The implementation uses np.searchsorted as its foundation to take bounds for the i-th
+    key based on the results of the previous i-1 keys.
+    """
+
+    normalizedkey = key.normalized_key()
+
+    if len(normalizedkey) == 0:
+        for name in table.column_names:
+            normalizedkey.append((name, "ascending"))
+
+    left, right = 0, table.num_rows
+    for i in range(len(desired)):
+
+        if left == right:
+            return right
+
+        colName = normalizedkey[i][0]
+        if normalizedkey[i][1] == "ascending":
+            dir = True 
+        else:
+            dir = False
+        colVals = table[colName][left:right]
+        desiredVal = desired[i]
+        prevleft = left
+
+        if not dir:
+            left = prevleft + (len(colVals) - np.searchsorted(colVals, desiredVal, side="right", sorter=np.arange(len(colVals) - 1, prevleft - 1, -1)))
+            right = prevleft + (len(colVals) - np.searchsorted(colVals, desiredVal, side="left", sorter=np.arange(len(colVals) - 1, prevleft - 1, -1)))
+        else:
+            left = prevleft + np.searchsorted(colVals, desiredVal, side="left")
+            right = prevleft + np.searchsorted(colVals, desiredVal, side="right")
+    
+    return right
+    
 
 def take_table(
     table: "pyarrow.Table",
@@ -27,14 +112,14 @@ def take_table(
     intermediate tables, not underlying an ArrowBlockAccessor.
     """
     from ray.air.util.transform_pyarrow import (
-        _is_column_extension_type,
         _concatenate_extension_column,
+        _is_column_extension_type,
     )
 
     if any(_is_column_extension_type(col) for col in table.columns):
         new_cols = []
         for col in table.columns:
-            if _is_column_extension_type(col):
+            if _is_column_extension_type(col) and col.num_chunks > 1:
                 # .take() will concatenate internally, which currently breaks for
                 # extension arrays.
                 col = _concatenate_extension_column(col)
@@ -50,11 +135,12 @@ def unify_schemas(
 ) -> "pyarrow.Schema":
     """Version of `pyarrow.unify_schemas()` which also handles checks for
     variable-shaped tensors in the given schemas."""
+    import pyarrow as pa
+
     from ray.air.util.tensor_extensions.arrow import (
         ArrowTensorType,
         ArrowVariableShapedTensorType,
     )
-    import pyarrow as pa
 
     schemas_to_unify = []
     schema_field_overrides = {}
@@ -124,10 +210,7 @@ def _concatenate_chunked_arrays(arrs: "pyarrow.ChunkedArray") -> "pyarrow.Chunke
     """
     Concatenate provided chunked arrays into a single chunked array.
     """
-    from ray.data.extensions import (
-        ArrowTensorType,
-        ArrowVariableShapedTensorType,
-    )
+    from ray.data.extensions import ArrowTensorType, ArrowVariableShapedTensorType
 
     # Single flat list of chunks across all chunked arrays.
     chunks = []
@@ -152,12 +235,13 @@ def concat(blocks: List["pyarrow.Table"]) -> "pyarrow.Table":
     """Concatenate provided Arrow Tables into a single Arrow Table. This has special
     handling for extension types that pyarrow.concat_tables does not yet support.
     """
+    import pyarrow as pa
+
     from ray.data.extensions import (
         ArrowTensorArray,
         ArrowTensorType,
         ArrowVariableShapedTensorType,
     )
-    import pyarrow as pa
 
     if not blocks:
         # Short-circuit on empty list of blocks.
@@ -259,8 +343,10 @@ def concat(blocks: List["pyarrow.Table"]) -> "pyarrow.Table":
 def concat_and_sort(
     blocks: List["pyarrow.Table"], key: "SortKeyT", descending: bool
 ) -> "pyarrow.Table":
+    import pyarrow.compute as pac
+
     ret = concat(blocks)
-    indices = pyarrow.compute.sort_indices(ret, sort_keys=key)
+    indices = pac.sort_indices(ret, sort_keys=key.to_arrow_sort_args())
     return take_table(ret, indices)
 
 

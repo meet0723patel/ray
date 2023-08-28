@@ -6,15 +6,16 @@ from ray.data._internal.execution.interfaces import (
     RefBundle,
     TaskContext,
 )
-from ray.data._internal.planner.exchange.push_based_shuffle_task_scheduler import (
-    PushBasedShuffleTaskScheduler,
-)
 from ray.data._internal.planner.exchange.pull_based_shuffle_task_scheduler import (
     PullBasedShuffleTaskScheduler,
 )
+from ray.data._internal.planner.exchange.push_based_shuffle_task_scheduler import (
+    PushBasedShuffleTaskScheduler,
+)
 from ray.data._internal.planner.exchange.sort_task_spec import SortKeyT, SortTaskSpec
+from ray.data._internal.sort_key import SortKey
 from ray.data._internal.stats import StatsDict
-from ray.data._internal.util import unify_block_metadata_schema
+from ray.data._internal.util import unify_block_metadata_schema, row_zip
 from ray.data.block import _validate_key_fn
 from ray.data.context import DataContext
 
@@ -41,28 +42,34 @@ def generate_sort_fn(
             return (blocks, {})
         unified_schema = unify_block_metadata_schema(metadata)
         _validate_key_fn(unified_schema, key)
-
-        if isinstance(key, str):
-            key = [(key, "descending" if descending else "ascending")]
-        if isinstance(key, list):
-            descending = key[0][1] == "descending"
+        if not callable(key) and not isinstance(key, SortKey):
+            key = SortKey(key, descending)
 
         num_mappers = len(blocks)
         # Use same number of output partitions.
         num_outputs = num_mappers
 
         # Sample boundaries for sort key.
-        boundaries = SortTaskSpec.sample_boundaries(blocks, key, num_outputs)
-        if descending:
-            boundaries.reverse()
-        sort_spec = SortTaskSpec(boundaries=boundaries, key=key, descending=descending)
+        boundaries = SortTaskSpec.sample_boundaries(blocks, key, num_outputs, descending)
+        orderedBoundaries = []
+        for idx, k in key:
+            if k[1] == "descending":
+                orderedBoundaries.append(list(reversed(boundaries[idx])))
+                continue
+            orderedBoundaries.append(boundaries[idx])
+        if len(orderedBoundaries) == 1:
+            orderedBoundaries = orderedBoundaries[0]
+        else:
+            orderedBoundaries = row_zip(orderedBoundaries)
+
+        sort_spec = SortTaskSpec(boundaries=orderedBoundaries, key=key, descending=descending)
 
         if DataContext.get_current().use_push_based_shuffle:
             scheduler = PushBasedShuffleTaskScheduler(sort_spec)
         else:
             scheduler = PullBasedShuffleTaskScheduler(sort_spec)
 
-        return scheduler.execute(refs, num_outputs)
+        return scheduler.execute(refs, num_outputs, ctx)
 
     # NOTE: use partial function to pass parameters to avoid error like
     # "UnboundLocalError: local variable ... referenced before assignment",

@@ -1,7 +1,7 @@
+import collections
 import os
 import sys
 import time
-import collections
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -17,13 +17,13 @@ from typing import (
 )
 
 import numpy as np
-import colorama
 
 import ray
 from ray import ObjectRefGenerator
 from ray.data._internal.util import _check_pyarrow_version, _truncated_repr
+from ray.data._internal.sort_key import SortKey
 from ray.types import ObjectRef
-from ray.util.annotations import DeveloperAPI, PublicAPI
+from ray.util.annotations import DeveloperAPI
 
 import psutil
 
@@ -51,39 +51,23 @@ U = TypeVar("U", covariant=True)
 KeyType = TypeVar("KeyType")
 AggType = TypeVar("AggType")
 
-STRICT_MODE_EXPLANATION = (
-    colorama.Fore.YELLOW
-    + "[IMPORTANT]: Ray Data strict mode is on by default in Ray 2.5. When in strict "
-    "mode, data schemas are required, standalone Python "
-    "objects are no longer supported, and the default batch format changes to `numpy` "
-    "from `pandas`. To disable strict mode temporarily, set the environment variable "
-    "RAY_DATA_STRICT_MODE=0 on all cluster processes. Strict mode will not be "
-    "possible to disable in future releases.\n\n"
-    "Learn more here: https://docs.ray.io/en/master/data/faq.html#what-is-strict-mode"
-    + colorama.Style.RESET_ALL
-)
-
-
-@PublicAPI
-class StrictModeError(ValueError):
-    def __init__(self, message: str):
-        super().__init__(message + "\n\n" + STRICT_MODE_EXPLANATION)
-
 
 def _validate_key_fn(
     schema: Optional[Union[type, "pyarrow.lib.Schema"]],
     key: Optional[str],
+    grouping: bool = False,
 ) -> None:
     """Check the key function is valid on the given schema."""
     if schema is None:
-        # Datastream is empty/cleared, validation not possible.
+        # Dataset is empty/cleared, validation not possible.
         return
-    ctx = ray.data.DataContext.get_current()
     is_simple_format = isinstance(schema, type)
-    if isinstance(key, str):
+    if isinstance(key, SortKey):
+        return
+    elif isinstance(key, str):
         if is_simple_format:
             raise ValueError(
-                "String key '{}' requires datastream format to be "
+                "String key '{}' requires dataset format to be "
                 "'arrow' or 'pandas', was 'simple'.".format(key)
             )
         if len(schema.names) > 0 and key not in schema.names:
@@ -91,29 +75,77 @@ def _validate_key_fn(
                 "The column '{}' does not exist in the "
                 "schema '{}'.".format(key, schema)
             )
-    elif ctx.strict_mode:
-        raise StrictModeError(f"In strict mode, the key must be a string, was: {key}")
+    # elif ctx.strict_mode:
+    #     raise StrictModeError(f"In Ray 2.5, the key must be a string, was: {key}")
     elif key is None:
         if not is_simple_format:
             raise ValueError(
-                "The `None` key '{}' requires datastream format to be "
+                "The `None` key '{}' requires dataset format to be "
                 "'simple'.".format(key)
             )
     elif callable(key):
         if not is_simple_format:
             raise ValueError(
-                "Callable key '{}' requires datastream format to be "
+                "Callable key '{}' requires dataset format to be "
                 "'simple'".format(key)
             )
+    elif isinstance(key, list):
+        if is_simple_format:
+            raise ValueError(
+                "List key '{}' requires dataset format to be "
+                "'arrow' or 'pandas', was 'simple'.".format(key)
+            )
+        if not key:
+            raise ValueError(
+                "List key '{}' cannot be empty. If you require sorting "
+                "by no columns, please use None as the paramater".format(key)
+            )
+        if len(schema.names) < len(key):
+            raise ValueError(
+                "There are more columns in '{}' than columns in "
+                "schema '{}'.".format(key, schema)
+            )
+        for k in key:
+            if isinstance(k, str):
+                if k not in schema.names:
+                    raise ValueError(
+                        "The column '{}' does not exist in the "
+                        "schema '{}'.".format(k, schema)
+                    )
+            elif isinstance(k, tuple):
+                if grouping:
+                    raise ValueError(
+                        "Invalid key '{}'. Grouping by multiple columns "
+                        "required a list of string column names".format(k)
+                    )
+                if len(k) != 2:
+                    raise ValueError(
+                        "Invalid key '{}'. Keys must be of the form "
+                        "(column, order).".format(k)
+                    )
+                col = k[0]
+                if col not in schema.names:
+                    raise ValueError(
+                        "The column '{}' does not exist in the "
+                        "schema '{}'.".format(col, schema)
+                    )
+                order = k[1]
+                if order != "ascending" and order != "descending":
+                    raise ValueError(
+                        "The order must be 'ascending' or 'descending.'"
+                        "Received '{}'.".format(order)
+                    )
+            else:
+                raise TypeError("Invalid key type {}. Must be a list of column names or of the form (column, order)".format(key))
     else:
         raise TypeError("Invalid key type {} ({}).".format(key, type(key)))
-
+    
 
 # Represents a batch of records to be stored in the Ray object store.
 #
-# Block data can be accessed in a uniform way via ``BlockAccessors`` such as
-# ``SimpleBlockAccessor`` and ``ArrowBlockAccessor``.
-Block = Union[list, "pyarrow.Table", "pandas.DataFrame", bytes]
+# Block data can be accessed in a uniform way via ``BlockAccessors`` like`
+# ``ArrowBlockAccessor``.
+Block = Union["pyarrow.Table", "pandas.DataFrame"]
 
 # User-facing data batch type. This is the data type for data that is supplied to and
 # returned from batch UDFs.
@@ -154,41 +186,31 @@ VALID_BATCH_FORMATS_STRICT_MODE = ["pandas", "pyarrow", "numpy", None]
 
 
 def _apply_strict_mode_batch_format(given_batch_format: Optional[str]) -> str:
-    ctx = ray.data.DataContext.get_current()
-    if ctx.strict_mode:
-        if given_batch_format == "default":
-            given_batch_format = "numpy"
-        if given_batch_format not in VALID_BATCH_FORMATS_STRICT_MODE:
-            raise StrictModeError(
-                f"The given batch format {given_batch_format} is not allowed "
-                f"in strict mode (must be one of {VALID_BATCH_FORMATS_STRICT_MODE})."
-            )
+    if given_batch_format == "default":
+        given_batch_format = "numpy"
+    if given_batch_format not in VALID_BATCH_FORMATS_STRICT_MODE:
+        raise ValueError(
+            f"The given batch format {given_batch_format} is not allowed "
+            f"in Ray 2.5 (must be one of {VALID_BATCH_FORMATS_STRICT_MODE})."
+        )
     return given_batch_format
 
 
 def _apply_strict_mode_batch_size(
     given_batch_size: Optional[Union[int, Literal["default"]]], use_gpu: bool
 ) -> Optional[int]:
-    ctx = ray.data.DatasetContext.get_current()
-    if ctx.strict_mode:
-        if use_gpu and (not given_batch_size or given_batch_size == "default"):
-            raise StrictModeError(
-                "`batch_size` must be provided to `map_batches` when requesting GPUs. "
-                "The optimal batch size depends on the model, data, and GPU used. "
-                "It is recommended to use the largest batch size that doesn't result "
-                "in your GPU device running out of memory. You can view the GPU memory "
-                "usage via the Ray dashboard."
-            )
-        elif given_batch_size == "default":
-            return ray.data.context.STRICT_MODE_DEFAULT_BATCH_SIZE
-        else:
-            return given_batch_size
-
+    if use_gpu and (not given_batch_size or given_batch_size == "default"):
+        raise ValueError(
+            "`batch_size` must be provided to `map_batches` when requesting GPUs. "
+            "The optimal batch size depends on the model, data, and GPU used. "
+            "It is recommended to use the largest batch size that doesn't result "
+            "in your GPU device running out of memory. You can view the GPU memory "
+            "usage via the Ray dashboard."
+        )
+    elif given_batch_size == "default":
+        return ray.data.context.STRICT_MODE_DEFAULT_BATCH_SIZE
     else:
-        if given_batch_size == "default":
-            return ray.data.context.DEFAULT_BATCH_SIZE
-        else:
-            return given_batch_size
+        return given_batch_size
 
 
 @DeveloperAPI
@@ -280,11 +302,6 @@ class BlockAccessor:
     Ideally, we wouldn't need a separate accessor classes for blocks. However,
     this is needed if we want to support storing ``pyarrow.Table`` directly
     as a top-level Ray object, without a wrapping class (issue #17186).
-
-    There are three types of block accessors: ``SimpleBlockAccessor``, which
-    operates over a plain Python list, ``ArrowBlockAccessor`` for
-    ``pyarrow.Table`` type blocks, ``PandasBlockAccessor`` for ``pandas.DataFrame``
-    type blocks.
     """
 
     def num_rows(self) -> int:
@@ -417,27 +434,21 @@ class BlockAccessor:
         """Create a block from user-facing data formats."""
 
         if isinstance(batch, np.ndarray):
-            from ray.data._internal.arrow_block import ArrowBlockAccessor
+            raise ValueError(
+                f"Error validating {_truncated_repr(batch)}: "
+                "Standalone numpy arrays are not "
+                "allowed in Ray 2.5. Return a dict of field -> array, "
+                "e.g., `{'data': array}` instead of `array`."
+            )
 
-            ctx = ray.data.DataContext.get_current()
-            if ctx.strict_mode:
-                raise StrictModeError(
-                    f"Error validating {_truncated_repr(batch)}: "
-                    "Standalone numpy arrays are not "
-                    "allowed in strict mode. Return a dict of field -> array, "
-                    "e.g., `{'data': array}` instead of `array`."
-                )
-
-            return ArrowBlockAccessor.numpy_to_block(batch)
         elif isinstance(batch, collections.abc.Mapping):
-            from ray.data._internal.arrow_block import ArrowBlockAccessor
             import pyarrow as pa
 
+            from ray.data._internal.arrow_block import ArrowBlockAccessor
+
             try:
-                return ArrowBlockAccessor.numpy_to_block(
-                    batch, passthrough_arrow_not_implemented_errors=True
-                )
-            except (pa.ArrowNotImplementedError, pa.ArrowInvalid):
+                return ArrowBlockAccessor.numpy_to_block(batch)
+            except (pa.ArrowNotImplementedError, pa.ArrowInvalid, pa.ArrowTypeError):
                 import pandas as pd
 
                 # TODO(ekl) once we support Python objects within Arrow blocks, we
@@ -465,22 +476,17 @@ class BlockAccessor:
 
             return ArrowBlockAccessor.from_bytes(block)
         elif isinstance(block, list):
-            from ray.data._internal.simple_block import SimpleBlockAccessor
-
-            ctx = ray.data.DataContext.get_current()
-            if ctx.strict_mode:
-                raise StrictModeError(
-                    f"Error validating {_truncated_repr(block)}: "
-                    "Standalone Python objects are not "
-                    "allowed in strict mode. To use Python objects in a datastream, "
-                    "wrap them in a dict of numpy arrays, e.g., "
-                    "return `{'item': np.array(batch)}` instead of just `batch`."
-                )
-            return SimpleBlockAccessor(block)
+            raise ValueError(
+                f"Error validating {_truncated_repr(block)}: "
+                "Standalone Python objects are not "
+                "allowed in Ray 2.5. To use Python objects in a dataset, "
+                "wrap them in a dict of numpy arrays, e.g., "
+                "return `{'item': batch}` instead of just `batch`."
+            )
         else:
             raise TypeError("Not a block type: {} ({})".format(block, type(block)))
 
-    def sample(self, n_samples: int, key: Any) -> "Block":
+    def sample(self, n_samples: int, key: Any, ascending: bool) -> "Block":
         """Return a random sample of items from this block."""
         raise NotImplementedError
 
@@ -506,4 +512,11 @@ class BlockAccessor:
         blocks: List[Block], key: Optional[str], agg: "AggregateFn"
     ) -> Tuple[Block, BlockMetadata]:
         """Aggregate partially combined and sorted blocks."""
+        raise NotImplementedError
+    
+    @staticmethod
+    def sorted_boundaries(
+        key: Any, descending: bool
+    ) -> List[Block]:
+        "Returns a sorted list of sample boundary points with respect n-dim key"
         raise NotImplementedError

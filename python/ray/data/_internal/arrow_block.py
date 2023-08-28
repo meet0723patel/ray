@@ -15,14 +15,16 @@ from typing import (
 )
 
 import numpy as np
+import json
 
-from ray.air.constants import TENSOR_COLUMN_NAME
 from ray._private.utils import _get_pyarrow_version
+from ray.air.constants import TENSOR_COLUMN_NAME
 from ray.data._internal.arrow_ops import transform_polars, transform_pyarrow
-from ray.data._internal.table_block import (
-    TableBlockAccessor,
-    TableBlockBuilder,
+from ray.data._internal.numpy_support import (
+    convert_udf_returns_to_numpy,
+    is_valid_udf_return,
 )
+from ray.data._internal.table_block import TableBlockAccessor, TableBlockBuilder
 from ray.data._internal.util import _truncated_repr
 from ray.data.aggregate import AggregateFn
 from ray.data.block import (
@@ -35,6 +37,7 @@ from ray.data.block import (
 )
 from ray.data.context import DataContext
 from ray.data.row import TableRow
+from ray.data._internal.sort_key import SortKey
 
 try:
     import pyarrow
@@ -59,16 +62,29 @@ def get_sort_transform(context: DataContext) -> Callable:
         return transform_pyarrow.sort
 
 
+def get_sort_indices_transform(context: DataContext) -> Callable:
+    if context.use_polars:
+        return transform_polars.sort_indices
+    
+    return transform_pyarrow.sort_indices
+
+
 def get_concat_and_sort_transform(context: DataContext) -> Callable:
     if context.use_polars:
         return transform_polars.concat_and_sort
     else:
         return transform_pyarrow.concat_and_sort
+    
+def get_searchsorted_transform(context: DataContext) -> Callable:
+    if context.use_polars:
+        return transform_polars.searchsorted
+    
+    return transform_pyarrow.searchsorted
 
 
 class ArrowRow(TableRow):
     """
-    Row of a tabular Datastream backed by a Arrow Table block.
+    Row of a tabular Dataset backed by a Arrow Table block.
     """
 
     def __getitem__(self, key: str) -> Any:
@@ -154,7 +170,6 @@ class ArrowBlockAccessor(TableBlockAccessor):
     @staticmethod
     def numpy_to_block(
         batch: Union[np.ndarray, Dict[str, np.ndarray], Dict[str, list]],
-        passthrough_arrow_not_implemented_errors: bool = False,
     ) -> "pyarrow.Table":
         import pyarrow as pa
 
@@ -163,7 +178,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
         if isinstance(batch, np.ndarray):
             batch = {TENSOR_COLUMN_NAME: batch}
         elif not isinstance(batch, collections.abc.Mapping) or any(
-            not isinstance(col, (list, np.ndarray)) for col in batch.values()
+            not is_valid_udf_return(col) for col in batch.values()
         ):
             raise ValueError(
                 "Batch must be an ndarray or dictionary of ndarrays when converting "
@@ -172,31 +187,11 @@ class ArrowBlockAccessor(TableBlockAccessor):
             )
         new_batch = {}
         for col_name, col in batch.items():
-            if isinstance(col, list):
-                # Try to convert list values into an numpy array via
-                # np.array(), so users don't need to manually cast.
-                # NOTE: we don't cast generic iterables, since types like
-                # `str` are also Iterable.
-                try:
-                    col = np.array(col)
-                except Exception:
-                    raise ValueError(
-                        "Failed to convert column values to numpy array: "
-                        f"({_truncated_repr(col)})."
-                    )
+            # Coerce to np.ndarray format if possible.
+            col = convert_udf_returns_to_numpy(col)
             # Use Arrow's native *List types for 1-dimensional ndarrays.
             if col.dtype.type is np.object_ or col.ndim > 1:
-                try:
-                    col = ArrowTensorArray.from_numpy(col)
-                except pa.ArrowNotImplementedError as e:
-                    if passthrough_arrow_not_implemented_errors:
-                        raise e
-                    raise ValueError(
-                        "Failed to convert multi-dimensional ndarray of dtype "
-                        f"{col.dtype} to our tensor extension since this dtype is not "
-                        "supported by Arrow. If encountering this due to string data, "
-                        'cast the ndarray to a string dtype, e.g. a.astype("U").'
-                    ) from e
+                col = ArrowTensorArray.from_numpy(col)
             new_batch[col_name] = col
         return pa.Table.from_pydict(new_batch)
 
@@ -261,11 +256,9 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
         if columns is None:
             columns = self._table.column_names
-            should_be_single_ndarray = self.is_tensor_wrapper()
+            should_be_single_ndarray = False
         elif isinstance(columns, list):
-            should_be_single_ndarray = (
-                columns == self._table_column_names and self.is_tensor_wrapper()
-            )
+            should_be_single_ndarray = False
         else:
             columns = [columns]
             should_be_single_ndarray = True
@@ -290,9 +283,9 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
         if should_be_single_ndarray:
             assert len(columns) == 1
-            arrays = arrays[0]
-        else:
-            arrays = dict(zip(columns, arrays))
+        #     arrays = arrays[0]
+        # else:
+        arrays = dict(zip(columns, arrays))
         return arrays
 
     def to_arrow(self) -> "pyarrow.Table":
@@ -351,7 +344,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
     def _sample(self, n_samples: int, key: "SortKeyT") -> "pyarrow.Table":
         indices = random.sample(range(self._table.num_rows), n_samples)
-        table = self._table.select([k[0] for k in key])
+        table = self._table.select([k for k in key.get_columns()])
         return transform_pyarrow.take_table(table, indices)
 
     def count(self, on: str) -> Optional[U]:
@@ -436,10 +429,6 @@ class ArrowBlockAccessor(TableBlockAccessor):
     def sort_and_partition(
         self, boundaries: List[T], key: "SortKeyT", descending: bool
     ) -> List["Block"]:
-        if len(key) > 1:
-            raise NotImplementedError(
-                "sorting by multiple columns is not supported yet"
-            )
 
         if self._table.num_rows == 0:
             # If the pyarrow table is empty we may not have schema
@@ -448,7 +437,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
         context = DataContext.get_current()
         sort = get_sort_transform(context)
-        col, _ = key[0]
+        searchsorted = get_searchsorted_transform(context)
         table = sort(self._table, key, descending)
         if len(boundaries) == 0:
             return [table]
@@ -460,13 +449,9 @@ class ArrowBlockAccessor(TableBlockAccessor):
         # partition[i]. If `descending` is true, `boundaries` would also be
         # in descending order and we only need to count the number of items
         # *greater than* the boundary value instead.
-        if descending:
-            num_rows = len(table[col])
-            bounds = num_rows - np.searchsorted(
-                table[col], boundaries, sorter=np.arange(num_rows - 1, -1, -1)
-            )
-        else:
-            bounds = np.searchsorted(table[col], boundaries)
+
+
+        bounds = searchsorted(table, boundaries, key, descending)
         last_idx = 0
         for idx in bounds:
             partitions.append(table.slice(last_idx, idx - last_idx))
@@ -489,15 +474,23 @@ class ArrowBlockAccessor(TableBlockAccessor):
             aggregation.
             If key is None then the k column is omitted.
         """
-        if key is not None and not isinstance(key, str):
+        if key is not None and not isinstance(key, SortKey):
             raise ValueError(
-                "key must be a string or None when aggregating on Arrow blocks, but "
+                "key must be a string, a list of strings or None when aggregating on Arrow blocks, but "
                 f"got: {type(key)}."
             )
+        
+        key_cols = key.get_columns()
+
+        def extract_key(row) -> Union[Any, List[Any]]:
+            currVals = []
+            for k in key_cols:
+                currVals.append(row[k])
+            return currVals
 
         def iter_groups() -> Iterator[Tuple[KeyType, Block]]:
             """Creates an iterator over zero-copy group views."""
-            if key is None:
+            if len(key) == 0:
                 # Global aggregation consists of a single "group", so we short-circuit.
                 yield None, self.to_block()
                 return
@@ -509,8 +502,8 @@ class ArrowBlockAccessor(TableBlockAccessor):
                 try:
                     if next_row is None:
                         next_row = next(iter)
-                    next_key = next_row[key]
-                    while next_row[key] == next_key:
+                    next_key = extract_key(next_row)
+                    while extract_key(next_row) == next_key:
                         end += 1
                         try:
                             next_row = next(iter)
@@ -531,8 +524,9 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
             # Build the row.
             row = {}
-            if key is not None:
-                row[key] = group_key
+            if len(key) != 0:
+                for i in range(len(key_cols)):
+                    row[key_cols[i]] = group_key[i]
 
             count = collections.defaultdict(int)
             for agg, accumulator in zip(aggs, accumulators):
@@ -593,7 +587,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
         stats = BlockExecStats.builder()
         key_fn = (
-            (lambda r: r[r._row.schema.names[0]]) if key is not None else (lambda r: 0)
+            (lambda r: tuple(r[r._row.schema.names[i]] for i in range(len(key)))) if len(key) != 0 else (lambda r: 0)
         )
 
         iter = heapq.merge(
@@ -610,9 +604,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
                 if next_row is None:
                     next_row = next(iter)
                 next_key = key_fn(next_row)
-                next_key_name = (
-                    next_row._row.schema.names[0] if key is not None else None
-                )
+                next_key_name = tuple(next_row._row.schema.names[i] for i in range(len(key))) if len(key) != 0 else None
 
                 def gen():
                     nonlocal iter
@@ -651,8 +643,10 @@ class ArrowBlockAccessor(TableBlockAccessor):
                             )
                 # Build the row.
                 row = {}
-                if key is not None:
-                    row[next_key_name] = next_key
+                if len(key) != 0:
+                    # row[next_key_name] = next_key
+                    for i in range(len(next_key_name)):
+                        row[next_key_name[i]] = next_key[i]
 
                 for agg, agg_name, accumulator in zip(
                     aggs, resolved_agg_names, accumulators

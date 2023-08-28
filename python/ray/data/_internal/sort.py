@@ -14,7 +14,7 @@ This is an all-to-all shuffle.
 
 Merging: a merge task would receive a block from every worker that consists
 of items in a certain range. It then merges the sorted blocks into one sorted
-block and becomes part of the new, sorted datastream.
+block and becomes part of the new, sorted dataset.
 """
 from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union
 
@@ -27,6 +27,8 @@ from ray.data._internal.progress_bar import ProgressBar
 from ray.data._internal.push_based_shuffle import PushBasedShufflePlan
 from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data._internal.shuffle import ShuffleOp, SimpleShufflePlan
+from ray.data._internal.util import row_zip, columnar_sort
+
 from ray.data.block import Block, BlockAccessor, BlockExecStats, BlockMetadata
 from ray.data.context import DataContext
 from ray.types import ObjectRef
@@ -36,8 +38,7 @@ T = TypeVar("T")
 # Data can be sorted by value (None), a list of columns and
 # ascending/descending orders (List), or a custom transform function
 # (Callable).
-SortKeyT = Union[None, List[Tuple[str, str]], Callable[[T], Any]]
-
+SortKeyT = Union[None, List[Union[str, Tuple[str, str]]], Callable[[T], Any]]
 
 class _SortOp(ShuffleOp):
     @staticmethod
@@ -83,14 +84,15 @@ def sample_boundaries(
     key: SortKeyT,
     num_reducers: int,
     ctx: Optional[TaskContext] = None,
+    descending: bool = False,
 ) -> List[T]:
     """
     Return (num_reducers - 1) items in ascending order from the blocks that
     partition the domain into ranges with approximately equally many elements.
     """
     # TODO(Clark): Support multiple boundary sampling keys.
-    if isinstance(key, list) and len(key) > 1:
-        raise ValueError("Multiple boundary sampling keys not supported.")
+    # if isinstance(key, list) and len(key) > 1:
+    #     raise ValueError("Multiple boundary sampling keys not supported.")
 
     n_samples = int(num_reducers * 10 / len(blocks))
 
@@ -113,21 +115,33 @@ def sample_boundaries(
         sample_bar.close()
     del sample_results
     samples = [s for s in samples if len(s) > 0]
-    # The datastream is empty
+    # The dataset is empty
     if len(samples) == 0:
-        return [None] * (num_reducers - 1)
+        return [[None] * (num_reducers - 1)]
     builder = DelegatingBlockBuilder()
     for sample in samples:
         builder.add_block(sample)
     samples = builder.build()
-    column = key[0][0] if isinstance(key, list) else None
-    sample_items = BlockAccessor.for_block(samples).to_numpy(column)
-    sample_items = np.sort(sample_items)
-    ret = [
-        np.quantile(sample_items, q, interpolation="nearest")
-        for q in np.linspace(0, 1, num_reducers)
-    ]
-    return ret[1:]
+    cols = key.get_columns() if len(key) > 0 else None
+    sample_items = BlockAccessor.for_block(samples).to_numpy(cols)
+    sample_items = columnar_sort(sample_items)
+    if len(sample_items.keys()) == 1:
+        sample_table = sample_items[list(sample_items.keys())[0]]
+        ret = [
+            np.quantile(sample_table, q, interpolation="nearest")
+            for q in np.linspace(0, 1, num_reducers)
+        ]
+        return [ret[1:]]
+
+    sample_table = np.array([v for _, v in sample_items.items()])
+    ret = []
+    for _, values in sample_items.items():
+        colCompute = [
+            np.quantile(values, q, interpolation="nearest")
+            for q in np.linspace(0, 1, num_reducers)
+        ]
+        ret.append(colCompute[1:])
+    return ret
 
 
 # Note: currently the map_groups() API relies on this implementation
@@ -144,19 +158,21 @@ def sort_impl(
     if len(blocks_list) == 0:
         return BlockList([], []), stage_info
 
-    if isinstance(key, str):
-        key = [(key, "descending" if descending else "ascending")]
-
-    if isinstance(key, list):
-        descending = key[0][1] == "descending"
-
     num_mappers = len(blocks_list)
     # Use same number of output partitions.
     num_reducers = num_mappers
     # TODO(swang): sample_boundaries could be fused with a previous stage.
-    boundaries = sample_boundaries(blocks_list, key, num_reducers, ctx)
-    if descending:
-        boundaries.reverse()
+    boundaries = sample_boundaries(blocks_list, key, num_reducers, ctx, descending)
+    orderedBoundaries = []
+    for idx, k in key:
+        if k[1] == "descending":
+            orderedBoundaries.append(list(reversed(boundaries[idx])))
+            continue
+        orderedBoundaries.append(boundaries[idx])
+    if len(orderedBoundaries) == 1:
+        orderedBoundaries = orderedBoundaries[0]
+    else:
+        orderedBoundaries = row_zip(orderedBoundaries)
 
     context = DataContext.get_current()
     if context.use_push_based_shuffle:

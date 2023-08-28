@@ -2,14 +2,9 @@ from typing import List, Optional, Tuple, Union
 
 from ray.data._internal.planner.exchange.interfaces import ExchangeTaskSpec
 from ray.data._internal.table_block import TableBlockAccessor
-from ray.data.aggregate import _AggregateOnKeyBase, AggregateFn, Count
-from ray.data.block import (
-    Block,
-    BlockAccessor,
-    BlockExecStats,
-    BlockMetadata,
-    KeyType,
-)
+from ray.data.aggregate import AggregateFn, Count
+from ray.data.aggregate._aggregate import _AggregateOnKeyBase
+from ray.data.block import Block, BlockAccessor, BlockExecStats, BlockMetadata, KeyType
 
 
 class SortAggregateTaskSpec(ExchangeTaskSpec):
@@ -52,12 +47,12 @@ class SortAggregateTaskSpec(ExchangeTaskSpec):
 
         block = SortAggregateTaskSpec._prune_unused_columns(block, key, aggs)
 
-        if key is None:
+        if len(key) == 0:
             partitions = [block]
         else:
             partitions = BlockAccessor.for_block(block).sort_and_partition(
                 boundaries,
-                [(key, "ascending")] if isinstance(key, str) else key,
+                key,
                 descending=False,
             )
         parts = [BlockAccessor.for_block(p).combine(key, aggs) for p in partitions]
@@ -87,10 +82,8 @@ class SortAggregateTaskSpec(ExchangeTaskSpec):
         prune_columns = True
         columns = set()
 
-        if isinstance(key, str):
-            columns.add(key)
-        elif callable(key):
-            prune_columns = False
+        for _, k in key:
+            columns.add(k[0])
 
         for agg in aggs:
             if isinstance(agg, _AggregateOnKeyBase) and isinstance(agg._key_fn, str):

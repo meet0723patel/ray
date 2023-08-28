@@ -1,24 +1,29 @@
 import importlib
 import logging
 import os
-from typing import Any, List, Union, Optional, TYPE_CHECKING
+from typing import Any, List, Union, Optional, TYPE_CHECKING, Tuple, Dict
 from types import ModuleType
+import pathlib
 import sys
+import urllib.parse
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import numpy as np
 
 import ray
-from ray.air.constants import TENSOR_COLUMN_NAME
+from ray._private.utils import _get_pyarrow_version
 from ray.data._internal.arrow_ops.transform_pyarrow import unify_schemas
 from ray.data.context import DataContext
-from ray._private.utils import _get_pyarrow_version
 
 if TYPE_CHECKING:
+    import pandas
+    import pyarrow
+
+    from ray.data._internal.compute import ComputeStrategy
+    from ray.data.block import Block, BlockMetadata, UserDefinedFunction
     from ray.data.datasource import Reader
     from ray.util.placement_group import PlacementGroup
-    import pyarrow
-    import pandas
-    from ray.data.block import Block, BlockMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +68,7 @@ def _check_pyarrow_version():
 
             if parse_version(version) < parse_version(MIN_PYARROW_VERSION):
                 raise ImportError(
-                    f"Datastream requires pyarrow >= {MIN_PYARROW_VERSION}, but "
+                    f"Dataset requires pyarrow >= {MIN_PYARROW_VERSION}, but "
                     f"{version} is installed. Reinstall with "
                     f'`pip install -U "pyarrow"`. '
                     "If you want to disable this pyarrow version check, set the "
@@ -74,7 +79,7 @@ def _check_pyarrow_version():
                 "You are using the 'pyarrow' module, but the exact version is unknown "
                 "(possibly carried as an internal component by another module). Please "
                 f"make sure you are using pyarrow >= {MIN_PYARROW_VERSION} to ensure "
-                "compatibility with Ray Datastream. "
+                "compatibility with Ray Dataset. "
                 "If you want to disable this pyarrow version check, set the "
                 f"environment variable {RAY_DISABLE_PYARROW_VERSION_CHECK}=1."
             )
@@ -87,7 +92,7 @@ def _autodetect_parallelism(
     ctx: DataContext,
     reader: Optional["Reader"] = None,
     avail_cpus: Optional[int] = None,
-) -> (int, int):
+) -> (int, int, Optional[int]):
     """Returns parallelism to use and the min safe parallelism to avoid OOMs.
 
     This detects parallelism using the following heuristics, applied in order:
@@ -103,13 +108,14 @@ def _autodetect_parallelism(
     Args:
         parallelism: The user-requested parallelism, or -1 for auto-detection.
         cur_pg: The current placement group, to be used for avail cpu calculation.
-        ctx: The current Datastream context to use for configs.
+        ctx: The current Dataset context to use for configs.
         reader: The datasource reader, to be used for data size estimation.
         avail_cpus: Override avail cpus detection (for testing only).
 
     Returns:
-        Tuple of detected parallelism (only if -1 was specified), and the min safe
-        parallelism (which can be used to generate warnings about large blocks).
+        Tuple of detected parallelism (only if -1 was specified), the min safe
+        parallelism (which can be used to generate warnings about large blocks),
+        and the estimated inmemory size of the dataset.
     """
     min_safe_parallelism = 1
     max_reasonable_parallelism = sys.maxsize
@@ -137,11 +143,11 @@ def _autodetect_parallelism(
             f"estimated_available_cpus={avail_cpus} and "
             f"estimated_data_size={mem_size}."
         )
-    return parallelism, min_safe_parallelism
+    return parallelism, min_safe_parallelism, mem_size
 
 
 def _estimate_avail_cpus(cur_pg: Optional["PlacementGroup"]) -> int:
-    """Estimates the available CPU parallelism for this Datastream in the cluster.
+    """Estimates the available CPU parallelism for this Dataset in the cluster.
 
     If we aren't in a placement group, this is trivially the number of CPUs in the
     cluster. Otherwise, we try to calculate how large the placement group is relative
@@ -155,7 +161,7 @@ def _estimate_avail_cpus(cur_pg: Optional["PlacementGroup"]) -> int:
 
     # If we're in a placement group, we shouldn't assume the entire cluster's
     # resources are available for us to use. Estimate an upper bound on what's
-    # reasonable to assume is available for datastreams to use.
+    # reasonable to assume is available for datasets to use.
     if cur_pg:
         pg_cpus = 0
         for bundle in cur_pg.bundle_specs:
@@ -175,7 +181,7 @@ def _estimate_avail_cpus(cur_pg: Optional["PlacementGroup"]) -> int:
 
 
 def _estimate_available_parallelism() -> int:
-    """Estimates the available CPU parallelism for this Datastream in the cluster.
+    """Estimates the available CPU parallelism for this Dataset in the cluster.
     If we are currently in a placement group, take that into account."""
     cur_pg = ray.util.get_current_placement_group()
     return _estimate_avail_cpus(cur_pg)
@@ -208,9 +214,6 @@ def _resolve_custom_scheme(path: str) -> str:
 
     The supported custom schemes are: "local", "example".
     """
-    import pathlib
-    import urllib.parse
-
     parsed_uri = urllib.parse.urlparse(path)
     if parsed_uri.scheme == _LOCAL_SCHEME:
         path = parsed_uri.netloc + parsed_uri.path
@@ -226,9 +229,6 @@ def _is_local_scheme(paths: Union[str, List[str]]) -> bool:
     Note: The paths must be in same scheme, i.e. it's invalid and
     will raise error if paths are mixed with different schemes.
     """
-    import pathlib
-    import urllib.parse
-
     if isinstance(paths, str):
         paths = [paths]
     if isinstance(paths, pathlib.Path):
@@ -244,10 +244,6 @@ def _is_local_scheme(paths: Union[str, List[str]]) -> bool:
             f"but found mixed {paths}"
         )
     return num == len(paths)
-
-
-def _is_tensor_schema(column_names: List[str]):
-    return column_names == [TENSOR_COLUMN_NAME]
 
 
 def _truncated_repr(obj: Any) -> str:
@@ -351,18 +347,18 @@ def _consumption_api(
     insert_after=False,
 ):
     """Annotate the function with an indication that it's a consumption API, and that it
-    will trigger Datastream execution.
+    will trigger Dataset execution.
     """
     base = (
         " will trigger execution of the lazy transformations performed on "
-        "this datastream."
+        "this dataset."
     )
     if delegate:
         message = delegate + base
     elif not if_more_than_read:
         message = "This operation" + base
     else:
-        condition = "If this datastream consists of more than a read, "
+        condition = "If this dataset consists of more than a read, "
         if datasource_metadata is not None:
             condition += (
                 f"or if the {datasource_metadata} can't be determined from the "
@@ -387,7 +383,7 @@ def _consumption_api(
 
 def ConsumptionAPI(*args, **kwargs):
     """Annotate the function with an indication that it's a consumption API, and that it
-    will trigger Datastream execution.
+    will trigger Dataset execution.
     """
     if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
         return _consumption_api()(args[0])
@@ -409,6 +405,23 @@ def _split_list(arr: List[Any], num_splits: int) -> List[List[Any]]:
         arr[i * q + min(i, r) : (i + 1) * q + min(i + 1, r)] for i in range(num_splits)
     ]
     return splits
+
+
+def validate_compute(
+    fn: "UserDefinedFunction", compute: Optional[Union[str, "ComputeStrategy"]]
+) -> None:
+    # Lazily import these objects to avoid circular imports.
+    from ray.data._internal.compute import TaskPoolStrategy
+    from ray.data.block import CallableClass
+
+    if isinstance(fn, CallableClass) and (
+        compute is None or compute == "tasks" or isinstance(compute, TaskPoolStrategy)
+    ):
+        raise ValueError(
+            "``compute`` must be specified when using a CallableClass, and must "
+            f"specify the actor compute strategy, but got: {compute}. "
+            "For example, use ``compute=ray.data.ActorPoolStrategy(size=n)``."
+        )
 
 
 def capfirst(s: str):
@@ -456,10 +469,7 @@ def ndarray_to_block(ndarray: np.ndarray, ctx: DataContext) -> "Block":
     DataContext._set_current(ctx)
 
     stats = BlockExecStats.builder()
-    if ctx.strict_mode:
-        block = BlockAccessor.batch_to_block({"data": ndarray})
-    else:
-        block = BlockAccessor.batch_to_block(ndarray)
+    block = BlockAccessor.batch_to_block({"data": ndarray})
     metadata = BlockAccessor.for_block(block).get_metadata(
         input_files=None, exec_stats=stats.build()
     )
@@ -505,3 +515,48 @@ def unify_block_metadata_schema(
         # return the first schema.
         return schemas_to_unify[0]
     return None
+
+
+# Return a list of zipped indices of given array
+def row_zip(arr: List[List[Any]]) -> List[Any]:
+    tup = tuple(arr)
+    return np.column_stack(tup)
+
+
+def dict_tonumpy(table: Dict[str, np.ndarray]) -> np.ndarray:
+    new_arr = []
+    for _, v in table.items():
+        new_arr.append(v)
+    return np.array(new_arr)
+
+def columnar_sort(table: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    new_dict = {}
+    for k, v in table.items():
+        new_dict[k] = np.sort(v)
+    return new_dict
+
+
+def custom_searchsorted(table: np.ndarray, val: List[Any], order: List[bool], descending: bool = False) -> int:
+    
+    left, right = 0, table.shape[0]
+    for i in range(len(val)):
+
+        if left == right:
+            return right
+
+        if order[i][1] == "ascending":
+            dir = True 
+        else:
+            dir = False
+        colVals = table[:, i][left:right]
+        desiredVal = val[i]
+        prevleft = left
+
+        if not dir:
+            left = prevleft + (len(colVals) - np.searchsorted(colVals, desiredVal, side="right", sorter=np.arange(len(colVals) - 1, -1, -1)))
+            right = prevleft + (len(colVals) - np.searchsorted(colVals, desiredVal, side="left", sorter=np.arange(len(colVals) - 1, -1, -1)))
+        else:
+            left = prevleft + np.searchsorted(colVals, desiredVal, side="left")
+            right = prevleft + np.searchsorted(colVals, desiredVal, side="right")
+
+    return right
